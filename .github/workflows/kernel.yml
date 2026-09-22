@@ -29,8 +29,8 @@ jobs:
         run: |
           #7.2.5 6.12.109 6.18.51 6.6.156
           wget -q "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-${{ github.event.inputs.version }}.tar.xz"
-          tar -xf "linux-${KVER}.tar.xz"
-          mv "linux-${KVER}" linux
+          tar -xf "linux-${{ github.event.inputs.version }}.tar.xz"
+          mv "linux-${{ github.event.inputs.version }}" linux
 
 
       - name: Install dependencies
