@@ -6,7 +6,12 @@ on:
       kernel_sign:
         description: '内核版本后缀(可留空)'
         required: false
-        default: ''
+        default: 'alice'
+      version:
+        description: "Release version (e.g. v1.0.0)"
+        required: true
+        default: '7.2.7'
+        type: string
 
 permissions:
   contents: write
@@ -22,8 +27,8 @@ jobs:
 
       - name: Download stable kernel source
         run: |
-          KVER=7.2.6   #7.2.5 6.12.109 6.18.51 6.6.156
-          wget -q "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-${KVER}.tar.xz"
+          #7.2.5 6.12.109 6.18.51 6.6.156
+          wget -q "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-${{ github.event.inputs.version }}.tar.xz"
           tar -xf "linux-${KVER}.tar.xz"
           mv "linux-${KVER}" linux
 
