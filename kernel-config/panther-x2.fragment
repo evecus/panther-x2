@@ -9,6 +9,29 @@ CONFIG_DRM=y
 CONFIG_DRM_PANFROST=y
 CONFIG_DMA_SHARED_BUFFER=y
 
+# ── btrfs-progs 配套（kmod-fs-btrfs + 全部依赖）──
+CONFIG_BTRFS_FS=y
+CONFIG_BTRFS_FS_POSIX_ACL=y
+# zstd/lzo/raid6/xor/xxhash/blake2b 由 BTRFS_FS select 自动带入，无需手写
+
+# ── zram-swap ──
+CONFIG_ZRAM=y
+
+# ── dnsmasq-full ──
+CONFIG_NF_CONNTRACK_NETLINK=y
+
+# ── ds-lite ──
+CONFIG_IPV6=y
+CONFIG_IPV6_TUNNEL=y
+
+# ── install-emmc 的 bootfs（mkfs.vfat 之后要能挂载）──
+CONFIG_VFAT_FS=y
+CONFIG_NLS=y
+CONFIG_NLS_CODEPAGE_437=y
+CONFIG_NLS_ISO8859_1=y
+CONFIG_NLS_UTF8=y
+
+
 # 明确关闭 NBD，避免因全内建被 olddefconfig 强制转成 =y
 CONFIG_BLK_DEV_NBD=n
 
