@@ -242,6 +242,7 @@ mkimage -C none -A arm -T script -d "$BOOT_MNT/boot.cmd" "$BOOT_MNT/boot.scr" > 
 # rootfs: 回填 fstab, 清理构建残留
 echo "UUID=${ROOT_UUID} / ext4 defaults,noatime 0 1" > "$RS/etc/fstab"
 echo "UUID=${BOOT_UUID} /boot ext4 defaults 0 2"    >> "$RS/etc/fstab"
+echo "tmpfs  /tmp  tmpfs  defaults,nosuid,nodev,size=512m  0  0"    >> "$RS/etc/fstab"
 rm -rf "$RS/debootstrap" "$RS/var/cache/apt/archives/"*.deb 2>/dev/null || true
 cp -a "$RS/." "$ROOT_MNT/"
 sync
