@@ -154,7 +154,7 @@ jobs:
               locales tzdata binutils \
               iproute2 network-manager \
               net-tools iputils-ping dnsutils \
-              wireless-tools chrony bc \
+              wireless-tools chrony bc network-manager-tui \
               bash-completion htop nano nftables \
               u-boot-tools initramfs-tools parted \
               btrfs-progs e2fsprogs dosfstools \
