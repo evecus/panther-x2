@@ -12,6 +12,7 @@ on:
         options:
           - bookworm
           - trixie
+          - forky
 
 
       armbian_fstype:
@@ -138,9 +139,11 @@ jobs:
             set -e
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -qq
-            # trixie 起 ntpdate 由 ntpsec-ntpdate 替代
-            NTPDATE_PKG=ntpdate
-            apt-cache policy ntpdate 2>/dev/null | grep -q 'Candidate: (none)' && NTPDATE_PKG=ntpsec-ntpdate || true
+            # bookworm 用 ntpdate；trixie/forky 起已移除，改用 ntpsec-ntpdate
+            case "${DEBIAN_RELEASE}" in
+              bookworm) NTPDATE_PKG=ntpdate ;;
+              *)        NTPDATE_PKG=ntpsec-ntpdate ;;
+            esac
             apt-get install -y \
               openssh-server sudo curl wget ca-certificates \
               locales tzdata binutils \
