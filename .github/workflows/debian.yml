@@ -151,7 +151,7 @@ jobs:
             esac
             apt-get install -y \
               openssh-server sudo curl wget ca-certificates \
-              locales tzdata binutils \
+              locales tzdata binutils bluez \
               iproute2 network-manager \
               net-tools iputils-ping dnsutils \
               wireless-tools chrony bc network-manager-tui \
