@@ -142,7 +142,7 @@ jobs:
             net-tools iputils bind-utils \
             iw wpa_supplicant chrony bc \
             bash-completion htop nano firewalld \
-            uboot-tools dracut parted \
+            uboot-tools dracut parted bluez \
             btrfs-progs e2fsprogs dosfstools \
             lsof file procps-ng cronie util-linux-user \
             rsync
