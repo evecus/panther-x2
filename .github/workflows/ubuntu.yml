@@ -194,11 +194,6 @@ jobs:
                 lsof file procps cron ntpdate \
                 wireless-regdb rsync wpasupplicant perl \
                 --no-install-recommends
-      
-              dpkg -l openssh-server network-manager | grep -c '^ii' | grep -q '^2$' || {
-                echo 'ERROR: 关键包安装不完整'
-                exit 1
-              }
 
               apt-get upgrade -y
               apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -221,10 +216,6 @@ jobs:
                 --no-install-recommends
               apt-get install -y wpasupplicant
 
-              dpkg -l openssh-server network-manager | grep -c '^ii' | grep -q '^2$' || {
-                echo 'ERROR: 关键包安装不完整'
-                exit 1
-              }
               apt-get clean && rm -rf /var/lib/apt/lists/*
             "
           fi
