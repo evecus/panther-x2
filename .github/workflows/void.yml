@@ -1,29 +1,18 @@
 name: RootFS Void
 
-# 官方 aarch64 ROOTFS tarball + xbps-install 装包。
-# Void 默认 runit（非 systemd）；服务用 runsv / ln -s 启用。
+# 官方 aarch64 ROOTFS tarball + xbps-install。Void 默认 runit。
 
 on:
   workflow_dispatch:
     inputs:
-      void_version:
-        description: "Void 版本线（glibc）"
-        required: false
-        default: "current"
-        type: choice
-        options:
-          - current
-
       root_password:
         description: "root 密码"
         required: false
         default: "1234"
-
       hostname:
         description: "主机名"
         required: false
         default: "void"
-
       timezone:
         description: "时区"
         required: false
@@ -31,9 +20,6 @@ on:
         type: choice
         options:
           - Asia/Shanghai
-          - Asia/Tokyo
-          - America/New_York
-          - Europe/London
           - UTC
 
 env:
@@ -60,21 +46,9 @@ jobs:
           [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
           sudo swapoff -a && sudo rm -f /swapfile /mnt/swapfile
-
           sudo -E apt-get -y update
-          sudo -E apt-get -y purge \
-            azure-cli ghc* zulu* llvm* firefox google* dotnet* \
-            powershell openjdk* mongodb* moby* 2>/dev/null || true
-          sudo -E apt-get -y install \
-            parted e2fsprogs dosfstools btrfs-progs \
-            u-boot-tools uuid-runtime openssl pigz \
-            git curl wget xz-utils lz4 zstd pv jq rsync \
-            libarchive-tools
-          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get -y install parted e2fsprogs dosfstools openssl pigz curl wget xz-utils zstd jq rsync
           sudo -E apt-get clean
-          sudo -E timedatectl set-timezone "${TZ}"
-
-          echo "VOID_VERSION=${{ inputs.void_version || 'current' }}" >> "${GITHUB_ENV}"
           echo "ROOT_PASSWORD=${{ inputs.root_password || '1234' }}" >> "${GITHUB_ENV}"
           echo "HOSTNAME_VAL=${{ inputs.hostname || 'void' }}" >> "${GITHUB_ENV}"
           echo "TZ_VAL=${{ inputs.timezone || 'Asia/Shanghai' }}" >> "${GITHUB_ENV}"
@@ -85,7 +59,7 @@ jobs:
         run: |
           mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//' ) - 1)
           root_size=$(expr $(df -h / | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//' ) - 4)
-          sudo truncate -s "${mnt_size}G"  /mnt/mnt.img
+          sudo truncate -s "${mnt_size}G" /mnt/mnt.img
           sudo truncate -s "${root_size}G" /root.img
           sudo losetup /dev/loop6 /mnt/mnt.img
           sudo losetup /dev/loop7 /root.img
@@ -93,23 +67,19 @@ jobs:
           sudo vgcreate github /dev/loop6 /dev/loop7
           sudo lvcreate -n runner -l 100%FREE github
           sudo mkfs.xfs -f -i sparse=0 /dev/github/runner
-          sudo mkdir -p /builder
-          sudo mount /dev/github/runner /builder
+          sudo mkdir -p /builder && sudo mount /dev/github/runner /builder
           sudo chown -R runner:runner /builder
-          echo "可用空间: $(df -h /builder | tail -1 | awk '{print $4}')"
 
       - name: Build Void rootfs
         id: build_rootfs
         if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
         run: |
           set -euo pipefail
-
           sudo mkdir -p "${ROOTFS_DIR}"
-
           mount_chroot() {
             local root="$1"
             sudo mkdir -p "${root}"/{proc,sys,dev,run}
-            sudo mount -t proc  proc  "${root}/proc"
+            sudo mount -t proc proc "${root}/proc"
             sudo mount -t sysfs sysfs "${root}/sys"
             sudo mount --rbind /dev "${root}/dev"
             sudo mount --make-rslave "${root}/dev"
@@ -118,54 +88,39 @@ jobs:
           force_umount() {
             local root="$1"
             if command -v findmnt >/dev/null 2>&1; then
-              while read -r tgt; do
-                [[ -n "$tgt" ]] || continue
-                sudo umount -l "$tgt" 2>/dev/null || true
+              while read -r tgt; do [[ -n "$tgt" ]] || continue; sudo umount -l "$tgt" 2>/dev/null || true
               done < <(findmnt -R -n -o TARGET --list "$root" 2>/dev/null | sort -r)
             fi
-            for sub in run dev sys proc; do
-              sudo umount -R -l "${root}/${sub}" 2>/dev/null || true
-            done
+            for sub in run dev sys proc; do sudo umount -R -l "${root}/${sub}" 2>/dev/null || true; done
           }
           trap 'force_umount "${ROOTFS_DIR}"' EXIT
-
-          MIRRORS=(
-            "https://repo-default.voidlinux.org/live/current"
-            "https://repo-fastly.voidlinux.org/live/current"
-          )
+          MIRRORS=("https://repo-default.voidlinux.org/live/current" "https://repo-fastly.voidlinux.org/live/current")
           downloaded=0
           VOID_MIRROR="https://repo-default.voidlinux.org"
           for base in "${MIRRORS[@]}"; do
-            echo "▶ 列出 ${base} ..."
             HTML=$(curl -fsSL "${base}/" 2>/dev/null || true)
             FILE=$(echo "$HTML" | grep -oE "void-aarch64-ROOTFS-[0-9]+\.tar\.xz" | sort -u | tail -1)
             [[ -n "$FILE" ]] || continue
-            echo "▶ 下载 ${base}/${FILE}"
-            if wget -q --show-progress --tries=3 --timeout=60 -O /tmp/void-rootfs.tar.xz "${base}/${FILE}"; then
+            if wget -q --tries=3 --timeout=60 -O /tmp/void-rootfs.tar.xz "${base}/${FILE}"; then
               downloaded=1
-              VOID_FILE="$FILE"
               VOID_MIRROR="${base%/live/current}"
               break
             fi
           done
-          [[ "$downloaded" -eq 1 ]] || { echo "::error::无法下载 Void aarch64 ROOTFS"; exit 1; }
-          echo "▶ 大小: $(du -sh /tmp/void-rootfs.tar.xz | awk '{print $1}') (${VOID_FILE})"
-
-          echo "▶ 解压 → ${ROOTFS_DIR} ..."
+          [[ "$downloaded" -eq 1 ]] || { echo "::error::下载 Void ROOTFS 失败"; exit 1; }
           sudo tar -xJf /tmp/void-rootfs.tar.xz -C "${ROOTFS_DIR}"
           rm -f /tmp/void-rootfs.tar.xz
-          [[ -d "${ROOTFS_DIR}/etc" ]] || { echo "::error::解压后无 /etc"; exit 1; }
-
-          printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' | sudo tee "${ROOTFS_DIR}/etc/resolv.conf" > /dev/null
+          echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" | sudo tee "${ROOTFS_DIR}/etc/resolv.conf" > /dev/null
           sudo mkdir -p "${ROOTFS_DIR}/etc/xbps.d"
           echo "repository=${VOID_MIRROR}/current/aarch64" | sudo tee "${ROOTFS_DIR}/etc/xbps.d/00-repository-main.conf" > /dev/null
-
           mount_chroot "${ROOTFS_DIR}"
-
-          echo "▶ xbps 更新并安装基础包..."
           sudo chroot "${ROOTFS_DIR}" /bin/bash -c '
             set +e
+            export XBPS_ARCH=aarch64
+            # 必须先 -S 刷新索引，再单独升级 xbps；否则本地缓存显示 up to date，-Suy 仍退出 16
+            xbps-install -S
             xbps-install -yu xbps
+            hash -r
             xbps-install -Suy
             xbps-install -Suy
             set -e
@@ -175,76 +130,34 @@ jobs:
               iproute2 NetworkManager \
               net-tools iputils \
               iw wpa_supplicant \
-              bash-completion htop nano \
-              u-boot-tools parted \
-              btrfs-progs e2fsprogs dosfstools \
-              lsof file procps-ng cronie \
-              rsync
+              htop nano \
+              parted e2fsprogs dosfstools rsync
             xbps-remove -Oy || true
           '
-
           sudo chroot "${ROOTFS_DIR}" ln -sf "/usr/share/zoneinfo/${TZ_VAL}" /etc/localtime 2>/dev/null || true
           echo "${HOSTNAME_VAL}" | sudo tee "${ROOTFS_DIR}/etc/hostname" > /dev/null
-          printf "127.0.0.1\tlocalhost\n127.0.1.1\t%s\n::1\tlocalhost ip6-localhost ip6-loopback\n" \
-            "${HOSTNAME_VAL}" | sudo tee "${ROOTFS_DIR}/etc/hosts" > /dev/null
-
-          sudo mkdir -p -m 0755 "${ROOTFS_DIR}/var/run/sshd" "${ROOTFS_DIR}/etc/ssh"
+          ROOT_HASH="$(openssl passwd -6 "${ROOT_PASSWORD}")"
+          sudo sed -i "s|^root:[^:]*|root:${ROOT_HASH}|" "${ROOTFS_DIR}/etc/shadow"
           if [[ -f "${ROOTFS_DIR}/etc/ssh/sshd_config" ]]; then
             sudo sed -i "s/^#*PermitRootLogin.*/PermitRootLogin yes/" "${ROOTFS_DIR}/etc/ssh/sshd_config"
             sudo sed -i "s/^#*PasswordAuthentication.*/PasswordAuthentication yes/" "${ROOTFS_DIR}/etc/ssh/sshd_config"
           fi
-
-          ROOT_HASH="$(openssl passwd -6 "${ROOT_PASSWORD}")"
-          sudo sed -i "s|^root:[^:]*|root:${ROOT_HASH}|" "${ROOTFS_DIR}/etc/shadow"
-
-          sudo chroot "${ROOTFS_DIR}" /bin/bash -c '
-            set +e
-            mkdir -p /var/service /etc/runit/runsvdir/default
-            for svc in sshd NetworkManager chronyd dhcpcd; do
-              if [[ -d /etc/sv/$svc ]]; then
-                ln -sf /etc/sv/$svc /var/service/$svc 2>/dev/null
-                ln -sf /etc/sv/$svc /etc/runit/runsvdir/default/$svc 2>/dev/null
-              fi
-            done
-          '
-
-          if [[ -f "${ROOTFS_DIR}/etc/os-release" ]]; then
-            grep -q "^VERSION_CODENAME=" "${ROOTFS_DIR}/etc/os-release" || \
-              echo "VERSION_CODENAME=void" | sudo tee -a "${ROOTFS_DIR}/etc/os-release" > /dev/null
-          fi
-
-          printf "LABEL=ROOTFS\t/\text4\tdefaults,noatime,nodiratime,commit=600,errors=remount-ro\t0 1\n" \
-            | sudo tee "${ROOTFS_DIR}/etc/fstab" > /dev/null
-          printf "LABEL=BOOT\t/boot\tvfat\tdefaults\t0 2\n" \
-            | sudo tee -a "${ROOTFS_DIR}/etc/fstab" > /dev/null
+          # 启用 runit 服务：/var/service 在 ROOTFS 中是指向 /run/runit/runsvdir/current 的 symlink，
+          # chroot 内 /run 为空 tmpfs（悬空），mkdir/ln 都会失败；正确做法是链接到 default runsvdir，
+          # 真机启动时 runit 会将 current 指向 default，服务自动拉起
+          sudo chroot "${ROOTFS_DIR}" /bin/bash -c 'mkdir -p /etc/runit/runsvdir/default; for s in sshd NetworkManager chronyd; do [[ -d /etc/sv/$s ]] && ln -sf /etc/sv/$s /etc/runit/runsvdir/default/$s; done'
+          grep -q "^VERSION_CODENAME=" "${ROOTFS_DIR}/etc/os-release" 2>/dev/null || echo "VERSION_CODENAME=void" | sudo tee -a "${ROOTFS_DIR}/etc/os-release" > /dev/null
+          printf "LABEL=ROOTFS\t/\text4\tdefaults,noatime\t0 1\nLABEL=BOOT\t/boot\tvfat\tdefaults\t0 2\n" | sudo tee "${ROOTFS_DIR}/etc/fstab" > /dev/null
           sudo mkdir -p "${ROOTFS_DIR}/usr/lib/modules"
-
-          force_umount "${ROOTFS_DIR}"
-          trap - EXIT
-
-          echo "▶ rootfs 最终大小: $(sudo du -sh ${ROOTFS_DIR} | awk '{print $1}')"
-          echo "status=success" >> "${GITHUB_OUTPUT}"
-
-      - name: Package rootfs
-        id: package_rootfs
-        if: ${{ steps.build_rootfs.outputs.status == 'success' && !cancelled() }}
-        run: |
-          set -euo pipefail
-          OUT_DIR="${GITHUB_WORKSPACE}/output"
-          mkdir -p "${OUT_DIR}"
-          TARBALL="Void_aarch64_rootfs.tar.gz"
-          sudo tar -czf "${OUT_DIR}/${TARBALL}" -C "${ROOTFS_DIR}" .
-          cd "${OUT_DIR}" && sha256sum "${TARBALL}" > "${TARBALL}.sha256"
-          echo "OUT_DIR=${OUT_DIR}" >> "${GITHUB_OUTPUT}"
+          force_umount "${ROOTFS_DIR}"; trap - EXIT
           echo "status=success" >> "${GITHUB_OUTPUT}"
 
       - name: Package rootfs into an image
         id: wrap_image
-        if: ${{ steps.package_rootfs.outputs.status == 'success' && !cancelled() }}
+        if: ${{ steps.build_rootfs.outputs.status == 'success' && !cancelled() }}
         run: |
           set -euo pipefail
-          WORK="${RUNNER_TEMP}/wrap"
-          sudo rm -rf "${WORK}" && mkdir -p "${WORK}"
+          WORK="${RUNNER_TEMP}/wrap"; sudo rm -rf "${WORK}" && mkdir -p "${WORK}"
           used_mb=$(sudo du -sm "${ROOTFS_DIR}" | awk '{print $1}')
           img_mb=$(( used_mb * 14 / 10 + 512 ))
           IMG_NAME="Void_aarch64_arm64_rootfs.img"
@@ -257,22 +170,17 @@ jobs:
           MNT="${WORK}/mnt"; mkdir -p "${MNT}"
           sudo mount "${LOOPDEV}p1" "${MNT}"
           sudo cp -a "${ROOTFS_DIR}/." "${MNT}/"
-          grep -q "^ID=" "${MNT}/etc/os-release"
-          grep -q "^VERSION_CODENAME=" "${MNT}/etc/os-release" || \
-            echo "VERSION_CODENAME=void" | sudo tee -a "${MNT}/etc/os-release" > /dev/null
+          grep -q "^VERSION_CODENAME=" "${MNT}/etc/os-release" || echo "VERSION_CODENAME=void" | sudo tee -a "${MNT}/etc/os-release" > /dev/null
           sync; sudo umount "${MNT}"; sudo losetup -d "${LOOPDEV}"
           xz -T0 -9 -f "${IMG_PATH}"
           OUT_DIR="${GITHUB_WORKSPACE}/output"; mkdir -p "${OUT_DIR}"
           mv -f "${IMG_PATH}.xz" "${OUT_DIR}/"
-          IMG_XZ_NAME="${IMG_NAME}.xz"
-          cd "${OUT_DIR}" && sha256sum "${IMG_XZ_NAME}" > "${IMG_XZ_NAME}.sha256"
-          echo "IMG_XZ_NAME=${IMG_XZ_NAME}" >> "${GITHUB_OUTPUT}"
-          echo "IMG_XZ_PATH=${OUT_DIR}/${IMG_XZ_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "IMG_XZ_PATH=${OUT_DIR}/${IMG_NAME}.xz" >> "${GITHUB_OUTPUT}"
           echo "status=success" >> "${GITHUB_OUTPUT}"
 
       - name: Release rootfs
         uses: ncipollo/release-action@main
-        if: ${{ steps.package_rootfs.outputs.status == 'success' && !cancelled() }}
+        if: ${{ steps.wrap_image.outputs.status == 'success' && !cancelled() }}
         with:
           tag: rootfs
           name: "rootfs"
