@@ -431,8 +431,8 @@ jobs:
           sudo rm -f "${ROOTFS_DIR}/etc/os-release"
           sudo tee "${ROOTFS_DIR}/etc/os-release" > /dev/null << 'OSREL_EOF'
           NAME="Arch Linux ARM"
-          ID=arch
-          ID_LIKE=arch
+          ID=archlinux
+          ID_LIKE=archlinux
           VERSION_CODENAME=rolling
           VERSION_ID=rolling
           PRETTY_NAME="Arch Linux ARM"
