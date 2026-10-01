@@ -119,7 +119,7 @@ jobs:
           make ARCH=arm64 defconfig
           ./scripts/kconfig/merge_config.sh -m .config \
             ../kernel-config/slim.fragment \
-            ../kernel-config/panther-x2.fragment
+            ../kernel-config/save.fragment
           make ARCH=arm64 olddefconfig
 
       - name: Apply kernel sign (写入 CONFIG_LOCALVERSION, 影响 uname -r)
