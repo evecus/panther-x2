@@ -4,11 +4,6 @@
 #   ./scripts/kconfig/merge_config.sh -m .config kernel-config/panther-x2.fragment
 #   make ARCH=arm64 olddefconfig
 # 参考基线: ophub kernel-config config-6.18 (只筛代理/路由/SBC 实际需要项)
-# GPU支持
-CONFIG_DRM=y
-CONFIG_DRM_PANFROST=y
-CONFIG_DMA_SHARED_BUFFER=y
-
 
 CONFIG_EXFAT_FS=y
 CONFIG_NTFS3_FS=y
