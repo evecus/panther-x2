@@ -1,4 +1,4 @@
-# ---------------------------------------------------------------- 1. 图形/显示
+#禁用gpu
 # 板上无 HDMI/MIPI/任何视频输出口，DRM/GPU/PANEL/BRIDGE 全部级联关闭
 CONFIG_DRM_PANFROST=n
 CONFIG_DMA_SHARED_BUFFER=n
