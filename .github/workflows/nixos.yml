@@ -1,4 +1,4 @@
-name: RootFS NixOS ARM64
+name: RootFS NixOS
 
 on:
   workflow_dispatch:
@@ -115,12 +115,28 @@ jobs:
             boot.loader.grub.enable = false;
             boot.loader.systemd-boot.enable = false;
 
-            # NixOS 要求必须声明根文件系统；这是纯 rootfs，
-            # device 仅作占位，不参与真实挂载。
+            # 标签与 rebuild 创建的分区一致(ROOTFS / BOOT)，install-to-emmc 克隆后标签不变，
+            # 因此不需要再改 fstab。
             fileSystems."/" = {
-              device = "/dev/disk/by-label/nixos-root";
+              device = "/dev/disk/by-label/ROOTFS";
               fsType = builtins.getEnv "NIXOS_FSTYPE";
+              options = [ "noatime" ];
             };
+            fileSystems."/boot" = {
+              device = "/dev/disk/by-label/BOOT";
+              fsType = "ext4";
+              options = [ "noatime" "nofail" ];
+            };
+
+            # 首次启动导入 Nix 数据库。不导入的话 store 路径未注册，
+            # nix.gc 会把整个系统当垃圾删掉。
+            boot.postBootCommands = ''
+              if [ -f /nix-path-registration ]; then
+                ${config.nix.package.out}/bin/nix-store --load-db < /nix-path-registration \
+                  && rm -f /nix-path-registration
+              fi
+              ${config.nix.package.out}/bin/nix-env -p /nix/var/nix/profiles/system --set /run/current-system
+            '';
 
             networking.hostName = builtins.getEnv "NIXOS_HOSTNAME";
             # 使用 systemd-networkd(去掉 NetworkManager / ModemManager / ppp)
@@ -172,6 +188,7 @@ jobs:
               util-linux
               e2fsprogs
               btrfs-progs
+              parted
             ];
 
             services.chrony.enable = true;
@@ -225,6 +242,82 @@ jobs:
             environment.stub-ld.enable = false;
             fonts.fontconfig.enable = false;
             i18n.supportedLocales = [ "en_US.UTF-8/UTF-8" ];
+
+            # ---- panther 运行时机制(原 rootfs-overlay 的 systemd 单元 / sysctl / modprobe) ----
+            # 脚本本体由 rebuild 放进 /usr/sbin，/etc/default/panther-* 与 /etc/balance_irq 可就地编辑。
+            boot.extraModprobeConfig = "options brcmfmac feature_disable=0x282000";
+
+            boot.kernel.sysctl = lib.mapAttrs (_: v: lib.mkForce v) {
+              "kernel.printk" = "7 4 1 7";
+              "net.ipv4.tcp_syncookies" = 1;
+              "net.ipv4.ip_forward" = 1;
+              "net.ipv6.conf.all.forwarding" = 1;
+              "net.ipv4.tcp_fin_timeout" = 30;
+              "net.ipv4.tcp_keepalive_time" = 120;
+              "net.ipv4.tcp_timestamps" = 1;
+              "net.ipv4.tcp_sack" = 1;
+              "net.ipv4.tcp_dsack" = 1;
+              "net.core.rmem_max" = 4194304;
+              "net.core.wmem_max" = 1048576;
+              "net.netfilter.nf_conntrack_acct" = 1;
+              "net.netfilter.nf_conntrack_checksum" = 0;
+              "net.netfilter.nf_conntrack_max" = 65535;
+              "net.netfilter.nf_conntrack_tcp_timeout_established" = 7440;
+              "net.netfilter.nf_conntrack_udp_timeout" = 60;
+              "net.netfilter.nf_conntrack_udp_timeout_stream" = 180;
+              "net.ipv4.tcp_congestion_control" = "bbr";
+              "net.core.default_qdisc" = "fq";
+            };
+
+            systemd.services.panther-resize = {
+              description = "Panther root filesystem auto-resize (first boot)";
+              wantedBy = [ "multi-user.target" ];
+              after = [ "local-fs.target" ];
+              before = [ "sshd.service" ];
+              unitConfig.ConditionPathExists = "!/var/lib/panther/resize-done";
+              path = with pkgs; [ util-linux e2fsprogs parted systemd coreutils ];
+              serviceConfig = {
+                Type = "oneshot";
+                ExecStart = "/usr/sbin/panther-resize";
+                TimeoutStartSec = "6min";
+              };
+            };
+
+            systemd.services.panther-irq = {
+              description = "Panther IRQ affinity & RPS balancing";
+              wantedBy = [ "multi-user.target" ];
+              after = [ "multi-user.target" ];
+              path = with pkgs; [ coreutils gawk gnugrep ];
+              serviceConfig = {
+                Type = "oneshot";
+                RemainAfterExit = true;
+                ExecStart = "/usr/sbin/balethirq";
+              };
+            };
+
+            systemd.services.panther-cpufreq = {
+              description = "Panther CPU frequency policy";
+              wantedBy = [ "multi-user.target" ];
+              after = [ "multi-user.target" ];
+              path = with pkgs; [ coreutils ];
+              serviceConfig = {
+                Type = "oneshot";
+                RemainAfterExit = true;
+                ExecStart = "/usr/sbin/panther-cpufreq";
+              };
+            };
+
+            systemd.services.panther-swapfile = {
+              description = "Panther swapfile";
+              wantedBy = [ "multi-user.target" ];
+              after = [ "local-fs.target" ];
+              path = with pkgs; [ coreutils util-linux ];
+              serviceConfig = {
+                Type = "oneshot";
+                RemainAfterExit = true;
+                ExecStart = "/usr/sbin/panther-swapfile";
+              };
+            };
 
             system.build.rootfs =
               let
@@ -283,7 +376,7 @@ jobs:
           if [ "${FSTYPE}" = "ext4" ]; then
             IMG="${OUTPUT_DIR}/nixos-aarch64-rootfs.ext4.img"
             truncate -s "${SIZE_MB}M" "${IMG}"
-            mkfs.ext4 -F -L nixos-root "${IMG}"
+            mkfs.ext4 -F -L ROOTFS "${IMG}"
 
             MNT="$(mktemp -d)"
             sudo mount -o loop "${IMG}" "${MNT}"
@@ -297,7 +390,7 @@ jobs:
           else
             IMG="${OUTPUT_DIR}/nixos-aarch64-rootfs.btrfs.img"
             truncate -s "${SIZE_MB}M" "${IMG}"
-            mkfs.btrfs -f -L nixos-root "${IMG}"
+            mkfs.btrfs -f -L ROOTFS "${IMG}"
 
             MNT="$(mktemp -d)"
             sudo mount -o loop "${IMG}" "${MNT}"
@@ -312,6 +405,7 @@ jobs:
 
           sha256sum "${OUTPUT_DIR}"/* > "${OUTPUT_DIR}/SHA256SUMS"
           ls -lh "${OUTPUT_DIR}"
+          mv nixos-output/nixos-aarch64-rootfs.*.img.xz nixos-output/NixOS-aarch64-rootfs.*.img.xz
 
       - name: Create release
         if: success()
@@ -320,4 +414,4 @@ jobs:
           tag_name: rootfs
           name: rootfs
           files: |
-            ${{ runner.temp }}/nixos-output/nixos-aarch64-rootfs.*.img.xz
+            ${{ runner.temp }}/NixOS-output/nixos-aarch64-rootfs.*.img.xz
