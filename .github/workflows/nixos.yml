@@ -1,4 +1,4 @@
-name: RootFS NixOS ARM64
+name: RootFS NixOS
 
 on:
   workflow_dispatch:
@@ -297,21 +297,13 @@ jobs:
             sudo chown "$(id -u):$(id -g)" "${IMG}"
             xz -T0 -f "${IMG}"
           fi
-
-          sha256sum "${OUTPUT_DIR}"/* > "${OUTPUT_DIR}/SHA256SUMS"
           ls -lh "${OUTPUT_DIR}"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: nixos-aarch64-rootfs
-          path: ${{ runner.temp }}/nixos-output/*
 
       - name: Create release
         if: success()
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: nixos-${{ github.run_number }}
-          name: NixOS ARM64 RootFS ${{ github.run_number }}
+          tag: "rootfs"
+          name: "rootfs"
           files: |
             ${{ runner.temp }}/nixos-output/nixos-aarch64-rootfs.*.img.xz
