@@ -102,6 +102,7 @@ jobs:
           export NIXOS_HOSTNAME="${HOSTNAME_VAL}"
           export NIXOS_TIMEZONE="${TZ_VAL}"
           export NIXOS_ROOT_PASSWORD="${HASHED_PASSWORD}"
+          export NIXOS_FSTYPE="${FSTYPE}"
 
           cat > "${BUILD_DIR}/configuration.nix" <<'EOF'
           { config, pkgs, lib, ... }:
@@ -112,6 +113,15 @@ jobs:
             nixpkgs.hostPlatform = "aarch64-linux";
 
             boot.loader.grub.enable = false;
+            boot.loader.systemd-boot.enable = false;
+            boot.initrd.enable = false;
+
+            # NixOS 要求必须声明根文件系统；这是纯 rootfs，
+            # device 仅作占位，不参与真实挂载。
+            fileSystems."/" = {
+              device = "/dev/disk/by-label/nixos-root";
+              fsType = builtins.getEnv "NIXOS_FSTYPE";
+            };
 
             networking.hostName = builtins.getEnv "NIXOS_HOSTNAME";
             networking.networkmanager.enable = true;
@@ -268,7 +278,7 @@ jobs:
           if [ "${FSTYPE}" = "ext4" ]; then
             IMG="${OUTPUT_DIR}/nixos-aarch64-rootfs.ext4.img"
             truncate -s "${SIZE_MB}M" "${IMG}"
-            mkfs.ext4 -F "${IMG}"
+            mkfs.ext4 -F -L nixos-root "${IMG}"
 
             MNT="$(mktemp -d)"
             sudo mount -o loop "${IMG}" "${MNT}"
@@ -281,7 +291,7 @@ jobs:
           else
             IMG="${OUTPUT_DIR}/nixos-aarch64-rootfs.btrfs.img"
             truncate -s "${SIZE_MB}M" "${IMG}"
-            mkfs.btrfs -f "${IMG}"
+            mkfs.btrfs -f -L nixos-root "${IMG}"
 
             MNT="$(mktemp -d)"
             sudo mount -o loop "${IMG}" "${MNT}"
