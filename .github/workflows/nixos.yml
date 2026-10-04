@@ -35,13 +35,19 @@ on:
         default: "Asia/Shanghai"
         type: string
 
+# 顶层 env 不可使用 runner 上下文，这里只放与 runner 无关的常量
 env:
   TZ: UTC
-  ROOTFS_DIR: ${{ runner.temp }}/nixos-rootfs
 
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
+
+    # runner 上下文在 job 级 env 合法；job env 会注入到每个 step 的 shell，
+    # 因此 BUILD/PACK/UPLOAD 各步骤都能引用 ${ROOTFS_DIR} / ${OUTPUT_DIR}
+    env:
+      ROOTFS_DIR: ${{ runner.temp }}/nixos-rootfs
+      OUTPUT_DIR: ${{ runner.temp }}/nixos-output
 
     steps:
       - name: Checkout
@@ -84,10 +90,7 @@ jobs:
           . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
 
           BUILD_DIR="${RUNNER_TEMP}/nixos-builder"
-          ROOTFS_DIR="${RUNNER_TEMP}/nixos-rootfs"
-          OUTPUT_DIR="${RUNNER_TEMP}/nixos-output"
-
-          export BUILD_DIR ROOTFS_DIR OUTPUT_DIR
+          export BUILD_DIR
 
           rm -rf "${BUILD_DIR}" "${ROOTFS_DIR}" "${OUTPUT_DIR}"
           mkdir -p "${BUILD_DIR}" "${ROOTFS_DIR}" "${OUTPUT_DIR}"
@@ -248,7 +251,7 @@ jobs:
 
           rm -rf "${ROOTFS_DIR}"
           mkdir -p "${ROOTFS_DIR}"
-          cp -a ${BUILD_DIR}/result/. "${ROOTFS_DIR}/"
+          cp -a "${BUILD_DIR}/result/." "${ROOTFS_DIR}/"
 
           echo "Rootfs contents:"
           du -sh "${ROOTFS_DIR}"
@@ -260,48 +263,50 @@ jobs:
         run: |
           set -euxo pipefail
 
-          mkdir -p ${OUTPUT_DIR}
+          mkdir -p "${OUTPUT_DIR}"
 
           tar -C "${ROOTFS_DIR}" \
             --numeric-owner \
-            -czf ${OUTPUT_DIR}/nixos-aarch64-rootfs.tar.gz .
+            -czf "${OUTPUT_DIR}/nixos-aarch64-rootfs.tar.gz" .
+
+          SIZE_MB="$(du -sm "${ROOTFS_DIR}" | awk '{print $1 + 256}')"
 
           if [ "${FSTYPE}" = "ext4" ]; then
-            SIZE_MB="$(du -sm "${ROOTFS_DIR}" | awk '{print $1 + 256}')"
-            truncate -s "${SIZE_MB}M" ${OUTPUT_DIR}/nixos-aarch64-rootfs.ext4.img
-            mkfs.ext4 -F ${OUTPUT_DIR}/nixos-aarch64-rootfs.ext4.img
+            IMG="${OUTPUT_DIR}/nixos-aarch64-rootfs.ext4.img"
+            truncate -s "${SIZE_MB}M" "${IMG}"
+            mkfs.ext4 -F "${IMG}"
 
             MNT="$(mktemp -d)"
-            sudo mount -o loop ${OUTPUT_DIR}/nixos-aarch64-rootfs.ext4.img "${MNT}"
+            sudo mount -o loop "${IMG}" "${MNT}"
             sudo cp -a "${ROOTFS_DIR}/." "${MNT}/"
             sync
             sudo umount "${MNT}"
             rmdir "${MNT}"
 
-            xz -T0 -f ${OUTPUT_DIR}/nixos-aarch64-rootfs.ext4.img
+            xz -T0 -f "${IMG}"
           else
-            SIZE_MB="$(du -sm "${ROOTFS_DIR}" | awk '{print $1 + 256}')"
-            truncate -s "${SIZE_MB}M" ${OUTPUT_DIR}/nixos-aarch64-rootfs.btrfs.img
-            mkfs.btrfs -f ${OUTPUT_DIR}/nixos-aarch64-rootfs.btrfs.img
+            IMG="${OUTPUT_DIR}/nixos-aarch64-rootfs.btrfs.img"
+            truncate -s "${SIZE_MB}M" "${IMG}"
+            mkfs.btrfs -f "${IMG}"
 
             MNT="$(mktemp -d)"
-            sudo mount -o loop ${OUTPUT_DIR}/nixos-aarch64-rootfs.btrfs.img "${MNT}"
+            sudo mount -o loop "${IMG}" "${MNT}"
             sudo cp -a "${ROOTFS_DIR}/." "${MNT}/"
             sync
             sudo umount "${MNT}"
             rmdir "${MNT}"
 
-            xz -T0 -f ${OUTPUT_DIR}/nixos-aarch64-rootfs.btrfs.img
+            xz -T0 -f "${IMG}"
           fi
 
-          sha256sum ${OUTPUT_DIR}/* > ${OUTPUT_DIR}/SHA256SUMS
-          ls -lh ${OUTPUT_DIR}
+          sha256sum "${OUTPUT_DIR}"/* > "${OUTPUT_DIR}/SHA256SUMS"
+          ls -lh "${OUTPUT_DIR}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: nixos-aarch64-rootfs
-          path: ${OUTPUT_DIR}/*
+          path: ${{ env.OUTPUT_DIR }}/*
 
       - name: Create release
         if: success()
@@ -309,8 +314,5 @@ jobs:
         with:
           tag_name: nixos-${{ github.run_number }}
           name: NixOS ARM64 RootFS ${{ github.run_number }}
-          generate_release_notes: true
           files: |
-            ${OUTPUT_DIR}/nixos-aarch64-rootfs.tar.gz
-            ${OUTPUT_DIR}/nixos-aarch64-rootfs.*.img.xz
-            ${OUTPUT_DIR}/SHA256SUMS
+            ${{ env.OUTPUT_DIR }}/nixos-aarch64-rootfs.*.img.xz
