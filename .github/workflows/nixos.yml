@@ -35,13 +35,13 @@ on:
         default: "Asia/Shanghai"
         type: string
 
-# 顶层 env 不可使用 runner 上下文，这里只放与 runner 无关的常量
 env:
   TZ: UTC
 
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -57,8 +57,7 @@ jobs:
             openssl \
             rsync \
             curl \
-            git \
-            xz-utils
+            git
 
       - name: Install Nix
         run: |
@@ -80,6 +79,10 @@ jobs:
         run: |
           set -euxo pipefail
 
+          ROOTFS_DIR="${RUNNER_TEMP}/nixos-rootfs"
+          OUTPUT_DIR="${RUNNER_TEMP}/nixos-output"
+          export ROOTFS_DIR OUTPUT_DIR
+
           . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
 
           BUILD_DIR="${RUNNER_TEMP}/nixos-builder"
@@ -94,8 +97,6 @@ jobs:
           echo "Timezone      : ${TZ_VAL}"
           echo "Filesystem    : ${FSTYPE}"
 
-          # Generate the password hash in Bash first. The Nix file below is quoted,
-          # so Bash will not try to expand Nix expressions such as ${config...}.
           HASHED_PASSWORD="$(openssl passwd -6 "${ROOT_PASSWORD}")"
 
           export NIXOS_HOSTNAME="${HOSTNAME_VAL}"
@@ -187,14 +188,11 @@ jobs:
               "d /tmp 1777 root root -"
             ];
 
-            # A plain rootfs tree. This is suitable as a filesystem rootfs archive;
-            # it is not a board-specific bootable SD/eMMC image.
             system.build.rootfs = pkgs.runCommand "nixos-rootfs" {
               nativeBuildInputs = [ pkgs.rsync ];
             } ''
               mkdir -p "$out"
 
-              # Copy the complete NixOS system closure into the rootfs.
               mkdir -p "$out/run/current-system"
               cp -a ${config.system.build.toplevel}/. "$out/run/current-system/"
 
@@ -233,7 +231,6 @@ jobs:
             -I nixos-config="${BUILD_DIR}/configuration.nix" \
             --no-out-link
 
-          # Re-run with an explicit result symlink so the path is easy to consume.
           nix-build \
             '<nixpkgs/nixos>' \
             -A config.system.build.rootfs \
@@ -255,6 +252,10 @@ jobs:
           FSTYPE: ${{ inputs.armbian_fstype }}
         run: |
           set -euxo pipefail
+
+          ROOTFS_DIR="${RUNNER_TEMP}/nixos-rootfs"
+          OUTPUT_DIR="${RUNNER_TEMP}/nixos-output"
+          export ROOTFS_DIR OUTPUT_DIR
 
           mkdir -p "${OUTPUT_DIR}"
 
@@ -299,7 +300,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nixos-aarch64-rootfs
-          path: ${{ env.OUTPUT_DIR }}/*
+          path: ${{ runner.temp }}/nixos-output/*
 
       - name: Create release
         if: success()
@@ -308,4 +309,4 @@ jobs:
           tag_name: nixos-${{ github.run_number }}
           name: NixOS ARM64 RootFS ${{ github.run_number }}
           files: |
-            ${{ env.OUTPUT_DIR }}/nixos-aarch64-rootfs.*.img.xz
+            ${{ runner.temp }}/nixos-output/nixos-aarch64-rootfs.*.img.xz
