@@ -114,7 +114,6 @@ jobs:
 
             boot.loader.grub.enable = false;
             boot.loader.systemd-boot.enable = false;
-            boot.initrd.enable = false;
 
             # NixOS 要求必须声明根文件系统；这是纯 rootfs，
             # device 仅作占位，不参与真实挂载。
