@@ -145,8 +145,6 @@ jobs:
               coreutils
               curl
               wget
-              git
-              vim
               nano
               htop
               procps
@@ -196,6 +194,25 @@ jobs:
             systemd.tmpfiles.rules = [
               "d /tmp 1777 root root -"
             ];
+
+            # ---- 精简：只保留 systemPackages 里明确声明的包 + 基础服务依赖 ----
+            # 纯 rootfs，由设备自带内核启动：不要内核 / modules / initrd
+            boot.kernel.enable = false;
+            boot.initrd.enable = false;
+            boot.bootspec.enable = false;
+            boot.enableContainers = false;
+
+            # 去掉默认附带的 perl / rsync / strace 等
+            environment.defaultPackages = lib.mkForce [ ];
+            # 去掉 nixos-rebuild(python) / nixos-generate-config / nixos-option 等
+            system.disableInstallerTools = true;
+
+            networking.modemmanager.enable = false;
+            programs.command-not-found.enable = false;
+            programs.bash.completion.enable = false;
+            environment.stub-ld.enable = false;
+            fonts.fontconfig.enable = false;
+            i18n.supportedLocales = [ "en_US.UTF-8/UTF-8" ];
 
             system.build.rootfs =
               let
