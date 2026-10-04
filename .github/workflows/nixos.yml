@@ -1,4 +1,4 @@
-name: RootFS NixOS
+name: RootFS NixOS ARM64
 
 on:
   workflow_dispatch:
@@ -123,8 +123,21 @@ jobs:
             };
 
             networking.hostName = builtins.getEnv "NIXOS_HOSTNAME";
-            networking.networkmanager.enable = true;
-            networking.useDHCP = lib.mkDefault true;
+            # 使用 systemd-networkd(去掉 NetworkManager / ModemManager / ppp)
+            networking.networkmanager.enable = false;
+            networking.useNetworkd = true;
+            networking.useDHCP = false;
+            systemd.network.enable = true;
+            systemd.network.networks."10-wired" = {
+              matchConfig.Name = "en* eth*";
+              networkConfig = {
+                DHCP = "yes";
+                IPv6AcceptRA = true;
+              };
+              linkConfig.RequiredForOnline = "no";
+            };
+            systemd.network.wait-online.enable = false;
+            services.resolved.enable = true;
 
             time.timeZone = builtins.getEnv "NIXOS_TIMEZONE";
 
@@ -207,7 +220,6 @@ jobs:
             # 去掉 nixos-rebuild(python) / nixos-generate-config / nixos-option 等
             system.disableInstallerTools = true;
 
-            networking.modemmanager.enable = false;
             programs.command-not-found.enable = false;
             programs.bash.completion.enable = false;
             environment.stub-ld.enable = false;
@@ -297,13 +309,15 @@ jobs:
             sudo chown "$(id -u):$(id -g)" "${IMG}"
             xz -T0 -f "${IMG}"
           fi
+
+          sha256sum "${OUTPUT_DIR}"/* > "${OUTPUT_DIR}/SHA256SUMS"
           ls -lh "${OUTPUT_DIR}"
 
       - name: Create release
         if: success()
         uses: softprops/action-gh-release@v2
         with:
-          tag: "rootfs"
-          name: "rootfs"
+          tag_name: rootfs
+          name: rootfs
           files: |
             ${{ runner.temp }}/nixos-output/nixos-aarch64-rootfs.*.img.xz
