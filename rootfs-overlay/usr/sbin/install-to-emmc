@@ -62,8 +62,11 @@ mkdir -p "$W/root/boot"
 echo "4/6 修正 UUID 与引导配置..."
 NEW_BOOT_UUID=$(lsblk -no UUID "${TGT}p1" | head -1)
 NEW_ROOT_UUID=$(lsblk -no UUID "${TGT}p2" | head -1)
-echo "UUID=${NEW_ROOT_UUID} / ext4 defaults,noatime 0 1" > "$W/root/etc/fstab"
-echo "UUID=${NEW_BOOT_UUID} /boot ext4 defaults 0 2"     >> "$W/root/etc/fstab"
+# NixOS 的 /etc/fstab 由系统生成(按 label ROOTFS/BOOT 挂载, 克隆后标签不变), 不能改写
+if [ ! -e /etc/NIXOS ]; then
+    echo "UUID=${NEW_ROOT_UUID} / ext4 defaults,noatime 0 1" > "$W/root/etc/fstab"
+    echo "UUID=${NEW_BOOT_UUID} /boot ext4 defaults 0 2"     >> "$W/root/etc/fstab"
+fi
 if [ -f "$W/boot/bootEnv.txt" ]; then
     sed -i "s|^rootdev=.*|rootdev=UUID=${NEW_ROOT_UUID}|g" "$W/boot/bootEnv.txt"
 fi
