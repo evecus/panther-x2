@@ -1,0 +1,671 @@
+name: RootFS NixOS
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      nixos_channel:
+        description: "NixOS 版本"
+        required: false
+        default: "nixos-25.11"
+        type: choice
+        options:
+          - nixos-25.11
+          - nixos-unstable
+
+      rootfs_fstype:
+        description: "rootfs 文件系统类型"
+        required: false
+        default: "ext4"
+        type: choice
+        options:
+          - ext4
+          - btrfs
+
+      root_password:
+        description: "root 密码"
+        required: false
+        default: "1234"
+
+      hostname:
+        description: "主机名"
+        required: false
+        default: "nixos"
+
+      timezone:
+        description: "时区"
+        required: false
+        default: "Asia/Shanghai"
+        type: choice
+        options:
+          - Asia/Shanghai
+          - UTC
+
+      extra_packages:
+        description: "额外软件包，例如: vim git htop"
+        required: false
+        default: ""
+
+env:
+  TZ: UTC
+  ROOTFS_DIR: /builder/nixos-rootfs
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+
+    if: ${{ github.event.repository.owner.id == github.event.sender.id }}
+
+    steps:
+
+      # ─────────────────────────────────────────────
+      # 1. Checkout
+      # ─────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+
+      # ─────────────────────────────────────────────
+      # 2. 初始化
+      # ─────────────────────────────────────────────
+      - name: Initialize environment
+        id: init
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+
+          sudo -E apt-get update
+
+          sudo -E apt-get install -y \
+            curl \
+            wget \
+            git \
+            xz-utils \
+            zstd \
+            gzip \
+            pigz \
+            parted \
+            e2fsprogs \
+            btrfs-progs \
+            dosfstools \
+            rsync \
+            openssl \
+            jq \
+            pv
+
+          sudo -E timedatectl set-timezone "${TZ}"
+
+          echo "NIXOS_CHANNEL=${{ inputs.nixos_channel || 'nixos-25.11' }}" >> "${GITHUB_ENV}"
+          echo "ROOT_PASSWORD=${{ inputs.root_password || '1234' }}" >> "${GITHUB_ENV}"
+          echo "HOSTNAME_VAL=${{ inputs.hostname || 'nixos' }}" >> "${GITHUB_ENV}"
+          echo "TZ_VAL=${{ inputs.timezone || 'Asia/Shanghai' }}" >> "${GITHUB_ENV}"
+          echo "EXTRA_PKGS=${{ inputs.extra_packages || '' }}" >> "${GITHUB_ENV}"
+
+          echo "status=success" >> "${GITHUB_OUTPUT}"
+
+
+      # ─────────────────────────────────────────────
+      # 3. 扩展构建空间
+      # ─────────────────────────────────────────────
+      - name: Create build disk
+        if: ${{ steps.init.outputs.status == 'success' }}
+        run: |
+          set -euo pipefail
+
+          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 1)
+          root_size=$(expr $(df -h / | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 4)
+
+          sudo truncate -s "${mnt_size}G" /mnt/mnt.img
+          sudo truncate -s "${root_size}G" /root.img
+
+          sudo losetup /dev/loop6 /mnt/mnt.img
+          sudo losetup /dev/loop7 /root.img
+
+          sudo pvcreate /dev/loop6 /dev/loop7
+          sudo vgcreate github /dev/loop6 /dev/loop7
+
+          sudo lvcreate \
+            -n runner \
+            -l 100%FREE \
+            github
+
+          sudo mkfs.xfs -f \
+            -i sparse=0 \
+            /dev/github/runner
+
+          sudo mkdir -p /builder
+          sudo mount /dev/github/runner /builder
+
+          sudo chown -R runner:runner /builder
+
+          echo "Build disk:"
+          df -h /builder
+
+
+      # ─────────────────────────────────────────────
+      # 4. 安装 Nix
+      # ─────────────────────────────────────────────
+      - name: Install Nix
+        run: |
+          set -euo pipefail
+
+          if command -v nix >/dev/null 2>&1; then
+            echo "Nix already installed"
+            nix --version
+            exit 0
+          fi
+
+          curl -L https://nixos.org/nix/install \
+            | sh -s -- --daemon
+
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+
+          nix --version
+
+          # 开启 flakes
+          sudo mkdir -p /etc/nix
+
+          sudo tee /etc/nix/nix.conf > /dev/null <<'EOF'
+          experimental-features = nix-command flakes
+          max-jobs = auto
+          cores = 0
+          EOF
+
+          sudo systemctl restart nix-daemon
+
+
+      # ─────────────────────────────────────────────
+      # 5. 构建 NixOS ARM64 rootfs
+      # ─────────────────────────────────────────────
+      - name: Build NixOS ARM64 rootfs
+        id: build_rootfs
+        run: |
+          set -euo pipefail
+
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+
+          mkdir -p "${ROOTFS_DIR}"
+
+          echo "=========================================="
+          echo "NixOS channel : ${NIXOS_CHANNEL}"
+          echo "Architecture  : aarch64-linux"
+          echo "Hostname      : ${HOSTNAME_VAL}"
+          echo "Timezone      : ${TZ_VAL}"
+          echo "=========================================="
+
+          # 生成 NixOS 配置
+          cat > /builder/configuration.nix <<EOF
+          { config, pkgs, lib, ... }:
+
+          {
+            system.stateVersion = "25.11";
+
+            # ========================================
+            # ARM64
+            # ========================================
+
+            nixpkgs.hostPlatform = "aarch64-linux";
+
+
+            # ========================================
+            # Boot
+            # ========================================
+
+            boot.loader.grub.enable = false;
+
+
+            # ========================================
+            # Hostname / Timezone
+            # ========================================
+
+            networking.hostName = "${HOSTNAME_VAL}";
+
+            time.timeZone = "${TZ_VAL}";
+
+
+            # ========================================
+            # Network
+            # ========================================
+
+            networking.useDHCP = true;
+
+            networking.useNetworkd = false;
+
+            networking.networkmanager.enable = true;
+
+
+            # ========================================
+            # SSH
+            # ========================================
+
+            services.openssh = {
+              enable = true;
+
+              settings = {
+                PermitRootLogin = "yes";
+                PasswordAuthentication = true;
+                KbdInteractiveAuthentication = true;
+                X11Forwarding = false;
+              };
+            };
+
+
+            # ========================================
+            # Root
+            # ========================================
+
+            users.users.root = {
+              hashedPassword = "$(openssl passwd -6 "${ROOT_PASSWORD}")";
+            };
+
+
+            # ========================================
+            # 基础服务器软件
+            # ========================================
+
+            environment.systemPackages =
+              with pkgs;
+              [
+                bash
+                coreutils
+                util-linux
+
+                curl
+                wget
+
+                git
+
+                vim
+                nano
+
+                htop
+
+                rsync
+
+                iproute2
+                iputils
+
+                dnsutils
+
+                pciutils
+                usbutils
+
+                lsof
+                file
+
+                procps
+
+                openssl
+
+                ca-certificates
+
+                bash-completion
+              ];
+
+
+            # ========================================
+            # 防火墙
+            # ========================================
+
+            networking.firewall = {
+              enable = true;
+
+              allowedTCPPorts = [
+                22
+              ];
+            };
+
+
+            # ========================================
+            # systemd
+            # ========================================
+
+            systemd.extraConfig = ''
+              DefaultTimeoutStartSec=10s
+              DefaultTimeoutStopSec=10s
+            '';
+
+
+            # ========================================
+            # Locale
+            # ========================================
+
+            i18n.defaultLocale = "en_US.UTF-8";
+
+            i18n.extraLocaleSettings = {
+              LC_TIME = "en_US.UTF-8";
+              LC_MONETARY = "en_US.UTF-8";
+              LC_ADDRESS = "en_US.UTF-8";
+              LC_IDENTIFICATION = "en_US.UTF-8";
+              LC_MEASUREMENT = "en_US.UTF-8";
+              LC_MESSAGES = "en_US.UTF-8";
+              LC_NAME = "en_US.UTF-8";
+              LC_NUMERIC = "en_US.UTF-8";
+              LC_PAPER = "en_US.UTF-8";
+              LC_TELEPHONE = "en_US.UTF-8";
+            };
+
+
+            # ========================================
+            # Nix
+            # ========================================
+
+            nix.settings = {
+              experimental-features = [
+                "nix-command"
+                "flakes"
+              ];
+
+              auto-optimise-store = true;
+            };
+
+
+            # ========================================
+            # 自动清理
+            # ========================================
+
+            nix.gc = {
+              automatic = true;
+
+              dates = "weekly";
+
+              options = "--delete-older-than 14d";
+            };
+
+
+            # ========================================
+            # 禁用不需要的东西
+            # ========================================
+
+            documentation = {
+              enable = false;
+
+              man.enable = false;
+
+              info.enable = false;
+
+              doc.enable = false;
+            };
+
+
+            # ========================================
+            # 无桌面
+            # ========================================
+
+            services.xserver.enable = false;
+
+            services.displayManager.sddm.enable = false;
+
+            services.desktopManager.plasma6.enable = false;
+
+            services.gnome.gnome-keyring.enable = false;
+
+
+            # ========================================
+            # 一些常用服务
+            # ========================================
+
+            services.chrony.enable = true;
+
+
+            # ========================================
+            # NTP
+            # ========================================
+
+            services.timesyncd.enable = false;
+
+
+            # ========================================
+            # /tmp
+            # ========================================
+
+            boot.tmp.cleanOnBoot = true;
+
+
+            # ========================================
+            # extra packages
+            # ========================================
+
+            environment.systemPackages =
+              with pkgs;
+              [
+                ${EXTRA_PKGS}
+              ];
+
+
+            # ========================================
+            # RootFS
+            # ========================================
+
+            system.build.rootfs = pkgs.runCommand "nixos-rootfs" {
+              nativeBuildInputs = [
+                pkgs.rsync
+              ];
+            } ''
+              mkdir -p \$out
+
+              rsync -aHAX \
+                --numeric-ids \
+                ${config.system.build.toplevel}/ \
+                \$out/
+
+              mkdir -p \$out/etc
+
+              cat > \$out/etc/os-release <<EOF
+          ID=nixos
+          NAME="NixOS"
+          PRETTY_NAME="NixOS ARM64 Server"
+          HOME_URL="https://nixos.org/"
+          SUPPORT_URL="https://nixos.org/community/"
+          BUG_REPORT_URL="https://github.com/NixOS/nixpkgs/issues"
+          EOF
+
+              echo "${HOSTNAME_VAL}" > \$out/etc/hostname
+            '';
+          }
+          EOF
+
+          echo "▶ Building NixOS..."
+
+          # 直接构建 ARM64 NixOS
+          nix-build \
+            '<nixpkgs/nixos>' \
+            -A config.system.build.rootfs \
+            --argstr system aarch64-linux \
+            -I nixpkgs="https://github.com/NixOS/nixpkgs/archive/${NIXOS_CHANNEL}.tar.gz" \
+            -I nixos-config=/builder/configuration.nix \
+            --option experimental-features "nix-command flakes"
+
+          # 找到构建结果
+          RESULT=$(readlink -f result)
+
+          echo "NixOS result:"
+          ls -lah "${RESULT}"
+
+          # 复制成实际 rootfs
+          sudo mkdir -p "${ROOTFS_DIR}"
+
+          sudo rsync -aHAX \
+            --numeric-ids \
+            "${RESULT}/" \
+            "${ROOTFS_DIR}/"
+
+          sudo mkdir -p \
+            "${ROOTFS_DIR}/proc" \
+            "${ROOTFS_DIR}/sys" \
+            "${ROOTFS_DIR}/dev" \
+            "${ROOTFS_DIR}/run" \
+            "${ROOTFS_DIR}/tmp"
+
+          sudo chmod 1777 "${ROOTFS_DIR}/tmp"
+
+          echo "RootFS size:"
+          sudo du -sh "${ROOTFS_DIR}"
+
+          echo "status=success" >> "${GITHUB_OUTPUT}"
+
+
+      # ─────────────────────────────────────────────
+      # 6. Package tar.gz
+      # ─────────────────────────────────────────────
+      - name: Package NixOS rootfs
+        id: package_rootfs
+        if: ${{ steps.build_rootfs.outputs.status == 'success' }}
+        run: |
+          set -euo pipefail
+
+          OUT_DIR="${GITHUB_WORKSPACE}/output"
+
+          mkdir -p "${OUT_DIR}"
+
+          TARBALL="NixOS_${NIXOS_CHANNEL}_aarch64_rootfs.tar.gz"
+
+          echo "▶ Creating ${TARBALL}"
+
+          sudo tar \
+            --numeric-owner \
+            --xattrs \
+            --acls \
+            -czf \
+            "${OUT_DIR}/${TARBALL}" \
+            -C "${ROOTFS_DIR}" \
+            .
+
+          cd "${OUT_DIR}"
+
+          sha256sum "${TARBALL}" \
+            > "${TARBALL}.sha256"
+
+          echo "RootFS:"
+          du -sh "${TARBALL}"
+
+          echo "TARBALL=${TARBALL}" \
+            >> "${GITHUB_OUTPUT}"
+
+          echo "OUT_DIR=${OUT_DIR}" \
+            >> "${GITHUB_OUTPUT}"
+
+
+      # ─────────────────────────────────────────────
+      # 7. 创建 ext4 rootfs image
+      # ─────────────────────────────────────────────
+      - name: Package rootfs into ext4 image
+        id: wrap_image
+        if: ${{ steps.build_rootfs.outputs.status == 'success' }}
+        run: |
+          set -euo pipefail
+
+          WORK="${RUNNER_TEMP}/nixos-image"
+
+          sudo rm -rf "${WORK}"
+
+          mkdir -p "${WORK}"
+
+          USED_MB=$(sudo du -sm "${ROOTFS_DIR}" | awk '{print $1}')
+
+          # 40% 余量 + 512MiB
+          IMG_MB=$(( USED_MB * 14 / 10 + 512 ))
+
+          IMG_NAME="NixOS_${NIXOS_CHANNEL}_aarch64_rootfs.img"
+
+          IMG_PATH="${WORK}/${IMG_NAME}"
+
+          echo "RootFS used : ${USED_MB} MiB"
+          echo "Image size  : ${IMG_MB} MiB"
+
+          truncate \
+            -s "${IMG_MB}M" \
+            "${IMG_PATH}"
+
+          # GPT / MBR 单 rootfs 分区
+          parted -s "${IMG_PATH}" \
+            mklabel msdos
+
+          parted -s "${IMG_PATH}" \
+            mkpart primary ext4 1MiB 100%
+
+          LOOPDEV=$(sudo losetup \
+            -P \
+            -f \
+            --show \
+            "${IMG_PATH}")
+
+          echo "Loop device: ${LOOPDEV}"
+
+          sudo mkfs.ext4 \
+            -F \
+            -L ROOTFS \
+            "${LOOPDEV}p1"
+
+          MNT="${WORK}/mnt"
+
+          mkdir -p "${MNT}"
+
+          sudo mount \
+            "${LOOPDEV}p1" \
+            "${MNT}"
+
+          echo "▶ Copy rootfs..."
+
+          sudo cp -a \
+            "${ROOTFS_DIR}/." \
+            "${MNT}/"
+
+          sync
+
+          sudo umount "${MNT}"
+
+          sudo losetup -d "${LOOPDEV}"
+
+          echo "▶ Compress image..."
+
+          xz \
+            -T0 \
+            -9 \
+            -f \
+            "${IMG_PATH}"
+
+          OUT_DIR="${GITHUB_WORKSPACE}/output"
+
+          mkdir -p "${OUT_DIR}"
+
+          mv \
+            "${IMG_PATH}.xz" \
+            "${OUT_DIR}/"
+
+          IMG_XZ_NAME="${IMG_NAME}.xz"
+
+          cd "${OUT_DIR}"
+
+          sha256sum \
+            "${IMG_XZ_NAME}" \
+            > "${IMG_XZ_NAME}.sha256"
+
+          echo "Image:"
+          du -sh "${IMG_XZ_NAME}"
+
+          echo "IMG_XZ_NAME=${IMG_XZ_NAME}" \
+            >> "${GITHUB_OUTPUT}"
+
+          echo "IMG_XZ_PATH=${OUT_DIR}/${IMG_XZ_NAME}" \
+            >> "${GITHUB_OUTPUT}"
+
+
+      # ─────────────────────────────────────────────
+      # 8. Release
+      # ─────────────────────────────────────────────
+      - name: Release NixOS rootfs
+        uses: ncipollo/release-action@main
+        with:
+          tag: nixos-rootfs
+          name: "NixOS ARM64 RootFS"
+          prerelease: true
+
+          artifacts: |
+            ${{ steps.package_rootfs.outputs.OUT_DIR }}/*
+            ${{ steps.wrap_image.outputs.IMG_XZ_PATH }}
+
+          allowUpdates: true
+
+          token: ${{ secrets.GITHUB_TOKEN }}
