@@ -405,7 +405,7 @@ jobs:
 
           sha256sum "${OUTPUT_DIR}"/* > "${OUTPUT_DIR}/SHA256SUMS"
           ls -lh "${OUTPUT_DIR}"
-          mv  ${{ runner.temp }}/nixos-output/nixos-aarch64-rootfs.*.img.xz  ${{ runner.temp }}/nixos-output/NixOS-aarch64-rootfs.*.img.xz
+          mv  ${{ runner.temp }}/nixos-output/nixos-aarch64-rootfs.*.img.xz  ${{ runner.temp }}/nixos-output/NixOS-aarch64-rootfs.img.xz
 
       - name: Create release
         if: success()
@@ -414,4 +414,4 @@ jobs:
           tag_name: rootfs
           name: rootfs
           files: |
-            ${{ runner.temp }}/NixOS-output/nixos-aarch64-rootfs.*.img.xz
+            ${{ runner.temp }}/nixos-output/NixOS-aarch64-rootfs.img.xz
