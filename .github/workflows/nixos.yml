@@ -37,7 +37,7 @@ on:
 
 env:
   TZ: UTC
-  ROOTFS_DIR: /builder/nixos-rootfs
+  ROOTFS_DIR: ${{ runner.temp }}/nixos-rootfs
 
 jobs:
   build:
@@ -83,7 +83,14 @@ jobs:
 
           . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
 
-          mkdir -p /builder "${ROOTFS_DIR}"
+          BUILD_DIR="${RUNNER_TEMP}/nixos-builder"
+          ROOTFS_DIR="${RUNNER_TEMP}/nixos-rootfs"
+          OUTPUT_DIR="${RUNNER_TEMP}/nixos-output"
+
+          export BUILD_DIR ROOTFS_DIR OUTPUT_DIR
+
+          rm -rf "${BUILD_DIR}" "${ROOTFS_DIR}" "${OUTPUT_DIR}"
+          mkdir -p "${BUILD_DIR}" "${ROOTFS_DIR}" "${OUTPUT_DIR}"
 
           echo "NixOS channel : ${NIXOS_CHANNEL}"
           echo "Architecture  : aarch64-linux"
@@ -99,7 +106,7 @@ jobs:
           export NIXOS_TIMEZONE="${TZ_VAL}"
           export NIXOS_ROOT_PASSWORD="${HASHED_PASSWORD}"
 
-          cat > /builder/configuration.nix <<'EOF'
+          cat > "${BUILD_DIR}/configuration.nix" <<'EOF'
           { config, pkgs, lib, ... }:
 
           {
@@ -218,7 +225,7 @@ jobs:
             -A config.system.build.toplevel \
             --argstr system aarch64-linux \
             -I nixpkgs="https://github.com/NixOS/nixpkgs/archive/${NIXOS_CHANNEL}.tar.gz" \
-            -I nixos-config=/builder/configuration.nix
+            -I nixos-config="${BUILD_DIR}/configuration.nix"
 
           echo "Building NixOS rootfs..."
 
@@ -227,7 +234,7 @@ jobs:
             -A config.system.build.rootfs \
             --argstr system aarch64-linux \
             -I nixpkgs="https://github.com/NixOS/nixpkgs/archive/${NIXOS_CHANNEL}.tar.gz" \
-            -I nixos-config=/builder/configuration.nix \
+            -I nixos-config="${BUILD_DIR}/configuration.nix" \
             --no-out-link
 
           # Re-run with an explicit result symlink so the path is easy to consume.
@@ -236,12 +243,12 @@ jobs:
             -A config.system.build.rootfs \
             --argstr system aarch64-linux \
             -I nixpkgs="https://github.com/NixOS/nixpkgs/archive/${NIXOS_CHANNEL}.tar.gz" \
-            -I nixos-config=/builder/configuration.nix \
-            -o /builder/result
+            -I nixos-config="${BUILD_DIR}/configuration.nix" \
+            -o "${BUILD_DIR}/result"
 
           rm -rf "${ROOTFS_DIR}"
           mkdir -p "${ROOTFS_DIR}"
-          cp -a /builder/result/. "${ROOTFS_DIR}/"
+          cp -a ${BUILD_DIR}/result/. "${ROOTFS_DIR}/"
 
           echo "Rootfs contents:"
           du -sh "${ROOTFS_DIR}"
@@ -253,48 +260,48 @@ jobs:
         run: |
           set -euxo pipefail
 
-          mkdir -p /builder/output
+          mkdir -p ${OUTPUT_DIR}
 
           tar -C "${ROOTFS_DIR}" \
             --numeric-owner \
-            -czf /builder/output/nixos-aarch64-rootfs.tar.gz .
+            -czf ${OUTPUT_DIR}/nixos-aarch64-rootfs.tar.gz .
 
           if [ "${FSTYPE}" = "ext4" ]; then
             SIZE_MB="$(du -sm "${ROOTFS_DIR}" | awk '{print $1 + 256}')"
-            truncate -s "${SIZE_MB}M" /builder/output/nixos-aarch64-rootfs.ext4.img
-            mkfs.ext4 -F /builder/output/nixos-aarch64-rootfs.ext4.img
+            truncate -s "${SIZE_MB}M" ${OUTPUT_DIR}/nixos-aarch64-rootfs.ext4.img
+            mkfs.ext4 -F ${OUTPUT_DIR}/nixos-aarch64-rootfs.ext4.img
 
             MNT="$(mktemp -d)"
-            sudo mount -o loop /builder/output/nixos-aarch64-rootfs.ext4.img "${MNT}"
+            sudo mount -o loop ${OUTPUT_DIR}/nixos-aarch64-rootfs.ext4.img "${MNT}"
             sudo cp -a "${ROOTFS_DIR}/." "${MNT}/"
             sync
             sudo umount "${MNT}"
             rmdir "${MNT}"
 
-            xz -T0 -f /builder/output/nixos-aarch64-rootfs.ext4.img
+            xz -T0 -f ${OUTPUT_DIR}/nixos-aarch64-rootfs.ext4.img
           else
             SIZE_MB="$(du -sm "${ROOTFS_DIR}" | awk '{print $1 + 256}')"
-            truncate -s "${SIZE_MB}M" /builder/output/nixos-aarch64-rootfs.btrfs.img
-            mkfs.btrfs -f /builder/output/nixos-aarch64-rootfs.btrfs.img
+            truncate -s "${SIZE_MB}M" ${OUTPUT_DIR}/nixos-aarch64-rootfs.btrfs.img
+            mkfs.btrfs -f ${OUTPUT_DIR}/nixos-aarch64-rootfs.btrfs.img
 
             MNT="$(mktemp -d)"
-            sudo mount -o loop /builder/output/nixos-aarch64-rootfs.btrfs.img "${MNT}"
+            sudo mount -o loop ${OUTPUT_DIR}/nixos-aarch64-rootfs.btrfs.img "${MNT}"
             sudo cp -a "${ROOTFS_DIR}/." "${MNT}/"
             sync
             sudo umount "${MNT}"
             rmdir "${MNT}"
 
-            xz -T0 -f /builder/output/nixos-aarch64-rootfs.btrfs.img
+            xz -T0 -f ${OUTPUT_DIR}/nixos-aarch64-rootfs.btrfs.img
           fi
 
-          sha256sum /builder/output/* > /builder/output/SHA256SUMS
-          ls -lh /builder/output
+          sha256sum ${OUTPUT_DIR}/* > ${OUTPUT_DIR}/SHA256SUMS
+          ls -lh ${OUTPUT_DIR}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: nixos-aarch64-rootfs
-          path: /builder/output/*
+          path: ${OUTPUT_DIR}/*
 
       - name: Create release
         if: success()
@@ -304,6 +311,6 @@ jobs:
           name: NixOS ARM64 RootFS ${{ github.run_number }}
           generate_release_notes: true
           files: |
-            /builder/output/nixos-aarch64-rootfs.tar.gz
-            /builder/output/nixos-aarch64-rootfs.*.img.xz
-            /builder/output/SHA256SUMS
+            ${OUTPUT_DIR}/nixos-aarch64-rootfs.tar.gz
+            ${OUTPUT_DIR}/nixos-aarch64-rootfs.*.img.xz
+            ${OUTPUT_DIR}/SHA256SUMS
