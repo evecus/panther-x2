@@ -197,38 +197,24 @@ jobs:
               "d /tmp 1777 root root -"
             ];
 
-            system.build.rootfs = pkgs.runCommand "nixos-rootfs" {
-              nativeBuildInputs = [ pkgs.rsync ];
-            } ''
-              mkdir -p "$out"
+            system.build.rootfs =
+              let
+                closure = pkgs.closureInfo { rootPaths = [ config.system.build.toplevel ]; };
+              in
+              pkgs.runCommand "nixos-rootfs" { } ''
+                mkdir -p "$out/nix/store"
+                xargs -a ${closure}/store-paths cp -a -t "$out/nix/store/"
+                cp ${closure}/registration "$out/nix-path-registration"
 
-              mkdir -p "$out/run/current-system"
-              cp -a ${config.system.build.toplevel}/. "$out/run/current-system/"
-
-              mkdir -p "$out/etc" "$out/var" "$out/home" "$out/root"
-              mkdir -p "$out/bin" "$out/sbin"
-
-              ln -sfn /run/current-system/sw/bin "$out/bin/sw"
-              ln -sfn /run/current-system/sw/bin/bash "$out/bin/bash"
-
-              cat > "$out/etc/NIXOS_ROOTFS" <<'ROOTFS_EOF'
-              This is a NixOS ARM64 root filesystem.
-              Architecture: aarch64-linux
-              ROOTFS_EOF
-            '';
+                mkdir -p "$out"/{etc,var,home,root,tmp,proc,sys,dev,run,sbin,bin,usr}
+                chmod 1777 "$out/tmp"
+                ln -s ${config.system.build.toplevel} "$out/nix-system"
+                ln -s ${config.system.build.toplevel}/init "$out/sbin/init"
+                ln -s ${config.system.build.toplevel}/init "$out/init"
+                touch "$out/etc/NIXOS"
+              '';
           }
           EOF
-
-          echo "Validating NixOS configuration..."
-
-          nix-instantiate \
-            --eval \
-            --strict \
-            '<nixpkgs/nixos>' \
-            -A config.system.build.toplevel \
-            --argstr system aarch64-linux \
-            -I nixpkgs="https://github.com/NixOS/nixpkgs/archive/${NIXOS_CHANNEL}.tar.gz" \
-            -I nixos-config="${BUILD_DIR}/configuration.nix"
 
           echo "Building NixOS rootfs..."
 
@@ -238,23 +224,13 @@ jobs:
             --argstr system aarch64-linux \
             -I nixpkgs="https://github.com/NixOS/nixpkgs/archive/${NIXOS_CHANNEL}.tar.gz" \
             -I nixos-config="${BUILD_DIR}/configuration.nix" \
-            --no-out-link
-
-          nix-build \
-            '<nixpkgs/nixos>' \
-            -A config.system.build.rootfs \
-            --argstr system aarch64-linux \
-            -I nixpkgs="https://github.com/NixOS/nixpkgs/archive/${NIXOS_CHANNEL}.tar.gz" \
-            -I nixos-config="${BUILD_DIR}/configuration.nix" \
             -o "${BUILD_DIR}/result"
 
-          rm -rf "${ROOTFS_DIR}"
-          mkdir -p "${ROOTFS_DIR}"
-          cp -a "${BUILD_DIR}/result/." "${ROOTFS_DIR}/"
+          sudo cp -a "${BUILD_DIR}/result/." "${ROOTFS_DIR}/"
 
           echo "Rootfs contents:"
-          du -sh "${ROOTFS_DIR}"
-          ls -la "${ROOTFS_DIR}"
+          sudo du -sh "${ROOTFS_DIR}"
+          sudo ls -la "${ROOTFS_DIR}"
 
       - name: Pack rootfs
         env:
@@ -268,11 +244,12 @@ jobs:
 
           mkdir -p "${OUTPUT_DIR}"
 
-          tar -C "${ROOTFS_DIR}" \
+          sudo tar -C "${ROOTFS_DIR}" \
             --numeric-owner \
             -czf "${OUTPUT_DIR}/nixos-aarch64-rootfs.tar.gz" .
+          sudo chown "$(id -u):$(id -g)" "${OUTPUT_DIR}/nixos-aarch64-rootfs.tar.gz"
 
-          SIZE_MB="$(du -sm "${ROOTFS_DIR}" | awk '{print $1 + 256}')"
+          SIZE_MB="$(sudo du -sm "${ROOTFS_DIR}" | awk '{print $1 + 256}')"
 
           if [ "${FSTYPE}" = "ext4" ]; then
             IMG="${OUTPUT_DIR}/nixos-aarch64-rootfs.ext4.img"
@@ -286,6 +263,7 @@ jobs:
             sudo umount "${MNT}"
             rmdir "${MNT}"
 
+            sudo chown "$(id -u):$(id -g)" "${IMG}"
             xz -T0 -f "${IMG}"
           else
             IMG="${OUTPUT_DIR}/nixos-aarch64-rootfs.btrfs.img"
@@ -299,6 +277,7 @@ jobs:
             sudo umount "${MNT}"
             rmdir "${MNT}"
 
+            sudo chown "$(id -u):$(id -g)" "${IMG}"
             xz -T0 -f "${IMG}"
           fi
 
