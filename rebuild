@@ -61,12 +61,27 @@ fi
 SRC_LOOP="$(losetup -P -f --show rootfs.img)"
 SRC_MNT="$WORK/src_root"
 mkdir -p "$SRC_MNT"
-if [[ -e "${SRC_LOOP}p2" ]]; then mount "${SRC_LOOP}p2" "$SRC_MNT"; else mount "${SRC_LOOP}p1" "$SRC_MNT"; fi
+if [[ -e "${SRC_LOOP}p2" ]]; then mount "${SRC_LOOP}p2" "$SRC_MNT"
+elif [[ -e "${SRC_LOOP}p1" ]]; then mount "${SRC_LOOP}p1" "$SRC_MNT"
+else mount "$SRC_LOOP" "$SRC_MNT"   # 无分区表的裸文件系统镜像 (NixOS rootfs)
+fi
 [[ -d "$SRC_MNT/etc" ]] || { echo "rootfs 镜像内容异常(未找到 /etc)"; exit 1; }
+IS_NIXOS=0
+[[ -e "$SRC_MNT/nix-path-registration" || -e "$SRC_MNT/etc/NIXOS" ]] && IS_NIXOS=1
+if [[ $IS_NIXOS -eq 1 ]]; then
+    # NixOS 的 /etc 在首次启动时才生成, 镜像里没有 os-release
+    NIX_SYS="$(readlink "$SRC_MNT/nix-system" || true)"
+    [[ -n "$NIX_SYS" && -f "${SRC_MNT}${NIX_SYS}/init" ]] || { echo "NixOS rootfs 缺少 /nix-system 或其 init"; exit 1; }
+    NIX_INIT="${NIX_SYS}/init"
+    OS_ID="nixos"
+    OS_CODENAME="$(basename "$NIX_SYS" | grep -oE '[0-9]{2}\.[0-9]{2}' | head -1 || true)"
+    echo "rootfs 底座: NixOS (${NIX_SYS})"
+else
 echo "rootfs 底座: $(cat "$SRC_MNT/etc/os-release" | grep PRETTY_NAME | cut -d'"' -f2)"
-# 发行版信息(用于产物命名与 build-info)
-OS_ID=$(grep -oE '^ID=.*' "$SRC_MNT/etc/os-release" | cut -d= -f2 | tr -d '"' | head -1)
-OS_CODENAME=$(grep -oE '^VERSION_CODENAME=.*' "$SRC_MNT/etc/os-release" | cut -d= -f2 | tr -d '"' | head -1)
+    # 发行版信息(用于产物命名与 build-info)
+    OS_ID=$(grep -oE '^ID=.*' "$SRC_MNT/etc/os-release" | cut -d= -f2 | tr -d '"' | head -1)
+    OS_CODENAME=$(grep -oE '^VERSION_CODENAME=.*' "$SRC_MNT/etc/os-release" | cut -d= -f2 | tr -d '"' | head -1)
+fi
 OS_ID=${OS_ID:-unknown}; OS_CODENAME=${OS_CODENAME:-unknown}
 echo "OS: ${OS_ID} / ${OS_CODENAME}"
 
@@ -75,6 +90,9 @@ RS="$WORK/rootfs"
 cp -a "$SRC_MNT/." "$RS/"
 umount "$SRC_MNT"; losetup -d "$SRC_LOOP"; SRC_MNT=""
 
+if [[ $IS_NIXOS -eq 1 ]]; then
+    echo "NixOS: root 密码在构建 rootfs 时已写入配置, 忽略 ROOT_PASS"
+else
 # root 密码 (直接改 /etc/shadow, 无需 chroot; openssl 生成 SHA512-crypt)
 HASH="$(openssl passwd -6 "$ROOT_PASS")"
 python3 - "$RS/etc/shadow" "$HASH" << 'PYEOF'
@@ -89,6 +107,7 @@ for line in open(path):
     out.append(line)
 open(path, "w").writelines(out)
 PYEOF
+fi
 
 # SSH 公钥 (可选)
 if [[ -n "$SSH_PUBKEY" ]]; then
@@ -97,6 +116,7 @@ if [[ -n "$SSH_PUBKEY" ]]; then
     chmod 600 "$RS/root/.ssh/authorized_keys"
 fi
 
+if [[ $IS_NIXOS -eq 0 ]]; then
 # 有线网口 DHCP (systemd-networkd) + DNS
 mkdir -p "$RS/etc/systemd/network" "$RS/etc/systemd/system/multi-user.target.wants"
 cat > "$RS/etc/systemd/network/10-eth0.network" << 'EOF'
@@ -110,23 +130,38 @@ for s in systemd-networkd.service systemd-resolved.service ssh.service; do
     ln -sf /usr/lib/systemd/system/${s} "$RS/etc/systemd/system/multi-user.target.wants/${s}"
 done
 rm -f "$RS/etc/resolv.conf"; echo "nameserver 223.5.5.5" > "$RS/etc/resolv.conf"
+fi
 
 # panther 运行时机制 (扩容/IRQ 调度/调频/swap/emmc 安装) — 来自 rootfs-overlay
 OVERLAY="${SCRIPT_DIR}/rootfs-overlay"
 if [[ -d "$OVERLAY" ]]; then
-    cp -a "$OVERLAY/." "$RS/"
-    # 显式逐一 chmod(不用通配: cp -a 自 Windows 文件系统时执行位不可靠, 且 glob 曾漏掉 balethirq)
-    chmod 755 "$RS/usr/sbin/panther-resize" \
-              "$RS/usr/sbin/balethirq" \
-              "$RS/usr/sbin/panther-cpufreq" \
-              "$RS/usr/sbin/panther-swapfile" \
+  if [[ $IS_NIXOS -eq 1 ]]; then
+    # NixOS: /etc 由系统管理, systemd 单元 / sysctl / modprobe 已写进 configuration.nix,
+    # 这里只放脚本与可就地编辑的配置文件
+    mkdir -p "$RS/usr/sbin" "$RS/etc/default"
+    cp -a "$OVERLAY/usr/sbin/." "$RS/usr/sbin/"
+    cp -a "$OVERLAY/etc/default/." "$RS/etc/default/"
+    cp -a "$OVERLAY/etc/balance_irq" "$RS/etc/balance_irq"
+    chmod 755 "$RS/usr/sbin/panther-resize" "$RS/usr/sbin/balethirq" \
+              "$RS/usr/sbin/panther-cpufreq" "$RS/usr/sbin/panther-swapfile" \
               "$RS/usr/sbin/install-to-emmc"
-    chmod 644 "$RS/etc/balance_irq" "$RS/etc/modprobe.d/brcmfmac.conf" \
-              "$RS/etc/default/panther-cpufreq" "$RS/etc/default/panther-swapfile"
-    for u in panther-resize.service panther-irq.service panther-cpufreq.service panther-swapfile.service; do
-        ln -sf "/etc/systemd/system/${u}" "$RS/etc/systemd/system/multi-user.target.wants/${u}"
-    done
-    echo "已安装 panther 运行时机制 (resize/irq/cpufreq/swapfile/install-to-emmc)"
+    chmod 644 "$RS/etc/balance_irq" "$RS/etc/default/panther-cpufreq" "$RS/etc/default/panther-swapfile"
+    echo "已安装 panther 脚本 (NixOS 单元由 configuration.nix 提供)"
+  else
+    cp -a "$OVERLAY/." "$RS/"
+      # 显式逐一 chmod(不用通配: cp -a 自 Windows 文件系统时执行位不可靠, 且 glob 曾漏掉 balethirq)
+      chmod 755 "$RS/usr/sbin/panther-resize" \
+                "$RS/usr/sbin/balethirq" \
+                "$RS/usr/sbin/panther-cpufreq" \
+                "$RS/usr/sbin/panther-swapfile" \
+                "$RS/usr/sbin/install-to-emmc"
+      chmod 644 "$RS/etc/balance_irq" "$RS/etc/modprobe.d/brcmfmac.conf" \
+                "$RS/etc/default/panther-cpufreq" "$RS/etc/default/panther-swapfile"
+      for u in panther-resize.service panther-irq.service panther-cpufreq.service panther-swapfile.service; do
+          ln -sf "/etc/systemd/system/${u}" "$RS/etc/systemd/system/multi-user.target.wants/${u}"
+      done
+      echo "已安装 panther 运行时机制 (resize/irq/cpufreq/swapfile/install-to-emmc)"
+  fi
 fi
 
 # 内核全内置 (无 modules), 不安装任何内核模块
@@ -172,6 +207,8 @@ cp "$DTB" "$BOOT_MNT/dtb/rockchip/"
 [[ -f "kernelpkg/boot/uInitrd" ]] || { echo "deb 中未找到 boot/uInitrd"; exit 1; }
 cp "kernelpkg/boot/uInitrd" "$BOOT_MNT/uInitrd"
 
+EXTRA_ARGS="rw rootwait"
+[[ $IS_NIXOS -eq 1 ]] && EXTRA_ARGS="${EXTRA_ARGS} init=${NIX_INIT}"
 cat > "$BOOT_MNT/bootEnv.txt" << EOF
 verbosity=1
 bootlogo=false
@@ -184,7 +221,7 @@ console=both
 consoleargs=console=ttyS02,1500000 console=tty0
 usbstoragequirks=0x2537:0x1066:u,0x2537:0x1068:u
 docker_optimizations=on
-extraargs=rw rootwait
+extraargs=${EXTRA_ARGS}
 extraboardargs=net.ifnames=0 max_loop=128
 overlay_prefix=rk3566
 overlays=
@@ -240,9 +277,13 @@ EOF
 mkimage -C none -A arm -T script -d "$BOOT_MNT/boot.cmd" "$BOOT_MNT/boot.scr" > /dev/null
 
 # rootfs: 回填 fstab, 清理构建残留
-echo "UUID=${ROOT_UUID} / ext4 defaults,noatime 0 1" > "$RS/etc/fstab"
-echo "UUID=${BOOT_UUID} /boot ext4 defaults 0 2"    >> "$RS/etc/fstab"
-echo "tmpfs  /tmp  tmpfs  defaults,nosuid,nodev,size=512m  0  0"    >> "$RS/etc/fstab"
+if [[ $IS_NIXOS -eq 1 ]]; then
+    echo "NixOS: fstab 由 configuration.nix 管理 (by-label ROOTFS / BOOT), 跳过"
+else
+    echo "UUID=${ROOT_UUID} / ext4 defaults,noatime 0 1" > "$RS/etc/fstab"
+    echo "UUID=${BOOT_UUID} /boot ext4 defaults 0 2"    >> "$RS/etc/fstab"
+    echo "tmpfs  /tmp  tmpfs  defaults,nosuid,nodev,size=512m  0  0"    >> "$RS/etc/fstab"
+fi
 rm -rf "$RS/debootstrap" "$RS/var/cache/apt/archives/"*.deb 2>/dev/null || true
 cp -a "$RS/." "$ROOT_MNT/"
 sync
@@ -270,8 +311,18 @@ for f in Image boot.scr bootEnv.txt uInitrd dtb/rockchip/rk3566-panther-x2.dtb; 
 done
 debugfs -R "stat /sbin/init" "$WORK/p2.img" >/dev/null 2>&1 && r=1 || r=0
 chk "p2:/sbin/init (init 系统存在)" $r
-debugfs -R "cat /etc/fstab" "$WORK/p2.img" 2>/dev/null | grep -q "$ROOT_UUID" && r=1 || r=0
-chk "p2:/etc/fstab 含 ROOT_UUID" $r
+if [[ $IS_NIXOS -eq 0 ]]; then
+    debugfs -R "cat /etc/fstab" "$WORK/p2.img" 2>/dev/null | grep -q "$ROOT_UUID" && r=1 || r=0
+    chk "p2:/etc/fstab 含 ROOT_UUID" $r
+fi
+if [[ $IS_NIXOS -eq 1 ]]; then
+    debugfs -R "stat ${NIX_INIT}" "$WORK/p2.img" >/dev/null 2>&1 && r=1 || r=0
+    chk "p2:${NIX_INIT} (NixOS stage-2 init)" $r
+    debugfs -R "stat /nix-path-registration" "$WORK/p2.img" >/dev/null 2>&1 && r=1 || r=0
+    chk "p2:/nix-path-registration (首启导入 Nix 数据库)" $r
+    debugfs -R "stat /usr/sbin/panther-resize" "$WORK/p2.img" >/dev/null 2>&1 && r=1 || r=0
+    chk "p2:/usr/sbin/panther-resize" $r
+fi
 echo "自检结果: PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]] || echo "!! 存在 FAIL 项, 镜像大概率无法启动 — 优先解决 FAIL 再烧写"
 rm -f "$WORK/p1.img" "$WORK/p2.img"
@@ -293,4 +344,8 @@ fi
 echo ""
 echo "完成: ${OUT}/panther-x2-${OS_ID}-${OS_CODENAME}-${KVER}.img.xz"
 echo "烧写: xzcat panther-x2-${OS_ID}-${OS_CODENAME}-${KVER}.img.xz | dd of=/dev/sdX bs=4M conv=fsync  (或 balenaEtcher)"
-echo "登录: root / ${ROOT_PASS} (串口 ttyS2@1500000 或 SSH, 首次登录后请修改)"
+if [[ $IS_NIXOS -eq 1 ]]; then
+    echo "登录: root / (构建 NixOS rootfs 时设置的密码) (串口 ttyS2@1500000 或 SSH)"
+else
+    echo "登录: root / ${ROOT_PASS} (串口 ttyS2@1500000 或 SSH, 首次登录后请修改)"
+fi
