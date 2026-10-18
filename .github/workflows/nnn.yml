@@ -14,8 +14,8 @@ on:
         required: false
         default: 'alice'
         type: string
-  schedule:
-    - cron: '0 8 * * *'
+ # schedule:
+    #- cron: '0 8 * * *'
 permissions:
   contents: write
 
@@ -106,7 +106,7 @@ jobs:
           V="${KVERSION}"
           MAJOR="${V%%.*}"
           wget -q "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/linux-7.3-rc7.tar.gz"
-          tar -xf "linux-${V}.tar.xz"
+          tar -zxvf "linux-${V}.tar.gz"
           mv "linux-${V}" linux
 
       - name: Install dependencies
