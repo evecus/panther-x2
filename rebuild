@@ -282,10 +282,13 @@ BOOT_UUID="$(lsblk -no UUID "${LOOP}p1" | head -1)"
 ROOT_UUID="$(lsblk -no UUID "${LOOP}p2" | head -1)"
 cp "$VMLINUZ" "$BOOT_MNT/Image"
 [[ -f "kernelpkg/boot/initrd.img" ]] && cp "kernelpkg/boot/initrd.img" "$BOOT_MNT/initrd.img"
-DTB="${SCRIPT_DIR}/dtb/rk3566-panther-x2.dtb"
-[[ -f "$DTB" ]] || { echo "缺少 ${DTB} — 请确认仓库已提交 dtb/rk3566-panther-x2.dtb"; exit 1; }
-mkdir -p "$BOOT_MNT/dtb/rockchip"
-cp "$DTB" "$BOOT_MNT/dtb/rockchip/"
+# 仓库里的 dtb 文件名 panther-x2.dtb 或 rk3566-panther-x2.dtb 均可, 复制到 boot 根目录并统一命名为 panther-x2.dtb
+DTB=""
+for n in panther-x2.dtb rk3566-panther-x2.dtb; do
+    [[ -f "${SCRIPT_DIR}/dtb/$n" ]] && { DTB="${SCRIPT_DIR}/dtb/$n"; break; }
+done
+[[ -n "$DTB" ]] || { echo "缺少 dtb — 请确认仓库已提交 dtb/panther-x2.dtb (或 dtb/rk3566-panther-x2.dtb)"; exit 1; }
+cp "$DTB" "$BOOT_MNT/panther-x2.dtb"
 [[ -f "kernelpkg/boot/uInitrd" ]] || { echo "deb 中未找到 boot/uInitrd"; exit 1; }
 cp "kernelpkg/boot/uInitrd" "$BOOT_MNT/uInitrd"
 
@@ -294,7 +297,7 @@ EXTRA_ARGS="rw rootwait"
 cat > "$BOOT_MNT/bootEnv.txt" << EOF
 verbosity=1
 bootlogo=false
-fdtfile=rockchip/rk3566-panther-x2.dtb
+fdtfile=panther-x2.dtb
 rootdev=UUID=${ROOT_UUID}
 rootfstype=ext4
 rootflags=rw,errors=remount-ro
@@ -348,7 +351,7 @@ if test "${docker_optimizations}" = "on"; then setenv bootargs "${bootargs} cgro
 load ${devtype} ${devnum} ${ramdisk_addr_r} ${prefix}uInitrd
 load ${devtype} ${devnum} ${kernel_addr_r} ${prefix}Image
 
-load ${devtype} ${devnum} ${fdt_addr_r} ${prefix}dtb/${fdtfile}
+load ${devtype} ${devnum} ${fdt_addr_r} ${prefix}${fdtfile}
 fdt addr ${fdt_addr_r}
 fdt resize 65536
 booti ${kernel_addr_r} ${ramdisk_addr_r} ${fdt_addr_r}
@@ -387,7 +390,7 @@ chk() {
 }
 dd if="$IMG" of="$WORK/p1.img" bs=1M skip=$SKIP_MB count=$BOOT_MB status=none
 dd if="$IMG" of="$WORK/p2.img" bs=1M skip=$((SKIP_MB + BOOT_MB)) count=$ROOT_MB status=none
-for f in Image boot.scr bootEnv.txt uInitrd dtb/rockchip/rk3566-panther-x2.dtb; do
+for f in Image boot.scr bootEnv.txt uInitrd panther-x2.dtb; do
     debugfs -R "stat /$f" "$WORK/p1.img" >/dev/null 2>&1 && r=1 || r=0
     chk "p1:/$f" $r
 done
