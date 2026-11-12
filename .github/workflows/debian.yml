@@ -63,40 +63,23 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          docker rmi -f $(docker images -q) 2>/dev/null || true
-          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
-          sudo swapoff -a && sudo rm -f /swapfile /mnt/swapfile
           sudo -E apt-get -y update
-          sudo -E apt-get -y purge \
-            azure-cli ghc* zulu* llvm* firefox google* dotnet* \
-            powershell openjdk* mongodb* moby* 2>/dev/null || true
           sudo -E apt-get -y install \
             debootstrap \
             parted e2fsprogs dosfstools btrfs-progs \
             u-boot-tools uuid-runtime openssl pigz \
-            git curl wget xz-utils lz4 zstd pv jq rsync
-          sudo -E apt-get -y autoremove --purge
-          sudo -E apt-get clean
+            curl wget xz-utils rsync
           sudo -E timedatectl set-timezone "${TZ}"
+
           # 写入运行时变量
           echo "DEBIAN_RELEASE=${{ inputs.debian_release || 'bookworm' }}" >> "${GITHUB_ENV}"
           echo "ROOT_PASSWORD=${{ inputs.root_password   || '1234' }}"     >> "${GITHUB_ENV}"
           echo "HOSTNAME_VAL=${{ inputs.hostname         || 'debian' }}"   >> "${GITHUB_ENV}"
           echo "TZ_VAL=${{ inputs.timezone               || 'Asia/Shanghai' }}" >> "${GITHUB_ENV}"
           echo "EXTRA_PKGS=${{ inputs.extra_packages     || '' }}"          >> "${GITHUB_ENV}"
-          # 判断模式：有 rootfs_url → 跳过构建
-          ROOTFS_URL="${{ inputs.rootfs_url }}"
-          if [[ -n "${ROOTFS_URL}" ]]; then
-            echo "BUILD_ROOTFS=false" >> "${GITHUB_ENV}"
-            echo "ROOTFS_URL=${ROOTFS_URL}" >> "${GITHUB_ENV}"
-            echo "▶ 模式：使用已有 rootfs → ${ROOTFS_URL}"
-          else
-            echo "BUILD_ROOTFS=true"  >> "${GITHUB_ENV}"
-            echo "ROOTFS_URL="        >> "${GITHUB_ENV}"
-            echo "▶ 模式：自建 rootfs"
-          fi
+
           echo "status=success" >> "${GITHUB_OUTPUT}"
+
       # ── 2. 合并磁盘空间 ───────────────────────────────────────────────
       - name: Create build disk
         if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
@@ -115,6 +98,7 @@ jobs:
           sudo mount /dev/github/runner /builder
           sudo chown -R runner:runner /builder
           echo "可用空间: $(df -h /builder | tail -1 | awk '{print $4}')"
+
       # ── 3A. 自建 rootfs（rootfs_url 为空时执行）──────────────────────
       - name: Build Debian rootfs
         id: build_rootfs
@@ -245,6 +229,7 @@ jobs:
           sudo umount "${ROOTFS_DIR}/proc"    2>/dev/null || true
           echo "▶ rootfs 完成: $(sudo du -sh ${ROOTFS_DIR} | awk '{print $1}')"
           echo "status=success" >> "${GITHUB_OUTPUT}"
+
       # ── 3B. 打包 rootfs tar.gz（仅自建模式）─────────────────────────
       - name: Package rootfs
         id: package_rootfs
