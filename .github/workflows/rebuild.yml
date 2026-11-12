@@ -4,13 +4,44 @@ on:
   repository_dispatch:
   workflow_dispatch:
     inputs:
-      kernel_deb_url:
-        description: "linux-image-*.deb 直链"
+      rootfs:
+        description: "发行版/版本 (未填 rootfs 直链时, 从本仓库 release 查找; latest=该发行版最新)"
         required: true
+        default: "debian/trixie"
+        type: choice
+        options:
+          - debian/bookworm
+          - debian/trixie
+          - debian/forky
+          - debian/latest
+          - ubuntu/noble
+          - ubuntu/jammy
+          - ubuntu/resolute
+          - ubuntu/latest
+          - alpine/latest
+          - alpine/edge
+          - fedora/44
+          - fedora/43
+          - fedora/latest
+          - archlinux/aarch64
+          - opensuse/tumbleweed
+          - opensuse/leap156
+          - void/latest
+          - openwrt/latest
+          - openwrt/25.12.5
+          - openwrt/25.12.0
+          - nixos/latest
+      kernel_version:
+        description: "内核版本, 如 7.3.8 或 7.3.8-alice (留空=release 中最新)"
+        required: false
+        default: ""
+      kernel_deb_url:
+        description: "linux-image-*.deb 直链 (可选, 填了就用链接, 不再去 release 找)"
+        required: false
         default: ""
       rootfs_url:
-        description: "rootfs 底座镜像直链"
-        required: true
+        description: "rootfs 底座镜像直链 (可选, 填了就用链接, 不再去 release 找)"
+        required: false
         default: ""
       root_mb:
         description: "rootfs 分区大小 MiB (不含 boot 512M)"
@@ -36,15 +67,18 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Assemble image
+        env:
+          KERNEL_DEB_URL: ${{ inputs.kernel_deb_url }}
+          ROOTFS_URL: ${{ inputs.rootfs_url }}
+          DISTRO: ${{ inputs.rootfs }}
+          KERNEL_VERSION: ${{ inputs.kernel_version }}
+          ROOT_MB: ${{ inputs.root_mb }}
+          ROOT_PASS: ${{ inputs.root_password }}
+          SSH_PUBKEY: ${{ inputs.ssh_pubkey }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          sudo -E \
-            KERNEL_DEB_URL="${{ inputs.kernel_deb_url }}" \
-            ROOTFS_URL="${{ inputs.rootfs_url }}" \
-            ROOT_MB="${{ inputs.root_mb }}" \
-            ROOT_PASS="${{ inputs.root_password }}" \
-            SSH_PUBKEY="${{ inputs.ssh_pubkey }}" \
-            OUT="${GITHUB_WORKSPACE}/out" \
-            bash rebuild
+          sudo -E OUT="${GITHUB_WORKSPACE}/out" bash rebuild
 
       - name: Prepare release files
         run: |
