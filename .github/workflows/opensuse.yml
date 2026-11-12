@@ -38,7 +38,7 @@ on:
 
 env:
   TZ: UTC
-  ROOTFS_DIR: /builder/opensuse-rootfs
+  ROOTFS_DIR: /opt/opensuse-rootfs
 
 jobs:
   build:
@@ -56,23 +56,10 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          docker rmi -f $(docker images -q) 2>/dev/null || true
-          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
-          sudo swapoff -a && sudo rm -f /swapfile /mnt/swapfile
-
           sudo -E apt-get -y update
-          sudo -E apt-get -y purge \
-            azure-cli ghc* zulu* llvm* firefox google* dotnet* \
-            powershell openjdk* mongodb* moby* 2>/dev/null || true
           sudo -E apt-get -y install \
-            skopeo jq \
-            parted e2fsprogs dosfstools btrfs-progs \
-            u-boot-tools uuid-runtime openssl pigz \
-            git curl wget xz-utils lz4 zstd pv rsync
-          sudo -E apt-get -y autoremove --purge
-          sudo -E apt-get clean
-          sudo -E timedatectl set-timezone "${TZ}"
+            skopeo jq zstd \
+            parted e2fsprogs openssl pigz
 
           REL="${{ inputs.opensuse_release || 'tumbleweed' }}"
           echo "OPENSUSE_RELEASE=${REL}" >> "${GITHUB_ENV}"
@@ -88,24 +75,6 @@ jobs:
             echo "RELEASE_TAG=leap156" >> "${GITHUB_ENV}"
           fi
           echo "status=success" >> "${GITHUB_OUTPUT}"
-
-      - name: Create build disk
-        if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
-        run: |
-          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//' ) - 1)
-          root_size=$(expr $(df -h / | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//' ) - 4)
-          sudo truncate -s "${mnt_size}G"  /mnt/mnt.img
-          sudo truncate -s "${root_size}G" /root.img
-          sudo losetup /dev/loop6 /mnt/mnt.img
-          sudo losetup /dev/loop7 /root.img
-          sudo pvcreate /dev/loop6 /dev/loop7
-          sudo vgcreate github /dev/loop6 /dev/loop7
-          sudo lvcreate -n runner -l 100%FREE github
-          sudo mkfs.xfs -f -i sparse=0 /dev/github/runner
-          sudo mkdir -p /builder
-          sudo mount /dev/github/runner /builder
-          sudo chown -R runner:runner /builder
-          echo "可用空间: $(df -h /builder | tail -1 | awk '{print $4}')"
 
       - name: Build openSUSE rootfs
         id: build_rootfs
@@ -184,12 +153,14 @@ jobs:
             zypper --non-interactive install -y --no-recommends \
               openssh-server sudo curl wget ca-certificates \
               timezone \
-              iproute2 NetworkManager \
+              iproute2 systemd-network \
               net-tools iputils \
               iw wpa_supplicant chrony bc \
               htop nano \
               parted e2fsprogs dosfstools \
               lsof file procps cron rsync
+            # 部分版本 systemd-resolved 是独立包，没有则忽略
+            zypper --non-interactive install -y --no-recommends systemd-resolved 2>/dev/null
             zypper --non-interactive rm -y -u kernel-default 2>/dev/null
             zypper --non-interactive clean -a
             rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/info/* 2>/dev/null
@@ -221,11 +192,15 @@ jobs:
 
           sudo chroot "${ROOTFS_DIR}" bash -c '
             systemctl enable sshd 2>/dev/null || systemctl enable ssh 2>/dev/null || true
-            systemctl enable NetworkManager 2>/dev/null || true
+            systemctl enable systemd-networkd 2>/dev/null || true
+            systemctl enable systemd-resolved 2>/dev/null || true
             systemctl enable chronyd 2>/dev/null || systemctl enable chrony 2>/dev/null || true
-            systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
-            systemctl disable systemd-networkd.service 2>/dev/null || true
+            systemctl disable systemd-networkd-wait-online.service 2>/dev/null || true
           '
+
+          sudo mkdir -p "${ROOTFS_DIR}/etc/systemd/network"
+          printf '[Match]\nName=en* eth*\n\n[Network]\nDHCP=yes\nIPv6AcceptRA=yes\n\n[DHCPv4]\nUseDomains=yes\n' \
+            | sudo tee "${ROOTFS_DIR}/etc/systemd/network/20-wired.network" > /dev/null
 
           if ! grep -q '^VERSION_CODENAME=' "${ROOTFS_DIR}/etc/os-release" 2>/dev/null; then
             echo "VERSION_CODENAME=${RELEASE_TAG}" | sudo tee -a "${ROOTFS_DIR}/etc/os-release" > /dev/null
@@ -241,6 +216,7 @@ jobs:
           force_umount "${ROOTFS_DIR}"
           trap - EXIT
           sudo rm -rf /tmp/oci-opensuse
+          sudo ln -sf ../run/systemd/resolve/stub-resolv.conf "${ROOTFS_DIR}/etc/resolv.conf"
 
           echo "▶ rootfs 最终大小: $(sudo du -sh ${ROOTFS_DIR} | awk '{print $1}')"
           echo "status=success" >> "${GITHUB_OUTPUT}"
@@ -284,14 +260,14 @@ jobs:
           sync
           sudo umount "${MNT}"
           sudo losetup -d "${LOOPDEV}"
-          xz -T0 -9 -f "${IMG_PATH}"
+          pigz -9 -f "${IMG_PATH}"
           OUT_DIR="${GITHUB_WORKSPACE}/output"
           mkdir -p "${OUT_DIR}"
-          mv -f "${IMG_PATH}.xz" "${OUT_DIR}/"
-          IMG_XZ_NAME="${IMG_NAME}.xz"
-          cd "${OUT_DIR}" && sha256sum "${IMG_XZ_NAME}" > "${IMG_XZ_NAME}.sha256"
-          echo "IMG_XZ_NAME=${IMG_XZ_NAME}" >> "${GITHUB_OUTPUT}"
-          echo "IMG_XZ_PATH=${OUT_DIR}/${IMG_XZ_NAME}" >> "${GITHUB_OUTPUT}"
+          mv -f "${IMG_PATH}.gz" "${OUT_DIR}/"
+          IMG_GZ_NAME="${IMG_NAME}.gz"
+          cd "${OUT_DIR}" && sha256sum "${IMG_GZ_NAME}" > "${IMG_GZ_NAME}.sha256"
+          echo "IMG_GZ_NAME=${IMG_GZ_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "IMG_GZ_PATH=${OUT_DIR}/${IMG_GZ_NAME}" >> "${GITHUB_OUTPUT}"
           echo "status=success" >> "${GITHUB_OUTPUT}"
 
       - name: Release rootfs
@@ -302,6 +278,6 @@ jobs:
           name: "rootfs"
           prerelease: true
           artifacts: |
-            ${{ steps.wrap_image.outputs.IMG_XZ_PATH }}
+            ${{ steps.wrap_image.outputs.IMG_GZ_PATH }}
           allowUpdates: true
           token: ${{ secrets.GITHUB_TOKEN }}

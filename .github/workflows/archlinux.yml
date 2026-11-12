@@ -36,7 +36,7 @@ on:
 
 env:
   TZ: UTC
-  ROOTFS_DIR: /builder/arch-rootfs
+  ROOTFS_DIR: /opt/arch-rootfs
 
 jobs:
   build:
@@ -55,50 +55,16 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          docker rmi -f $(docker images -q) 2>/dev/null || true
-          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
-          sudo swapoff -a && sudo rm -f /swapfile /mnt/swapfile
-
           sudo -E apt-get -y update
-          sudo -E apt-get -y purge \
-            azure-cli ghc* zulu* llvm* firefox google* dotnet* \
-            powershell openjdk* mongodb* moby* 2>/dev/null || true
-          # bsdtar 来自 libarchive-tools（解压 ALARM tarball 必需，保留 capability xattr）
           sudo -E apt-get -y install \
-            parted e2fsprogs dosfstools btrfs-progs \
-            u-boot-tools uuid-runtime openssl pigz \
-            git curl wget xz-utils lz4 zstd pv jq rsync \
-            libarchive-tools
-          sudo -E apt-get -y autoremove --purge
-          sudo -E apt-get clean
-          sudo -E timedatectl set-timezone "${TZ}"
+            wget libarchive-tools \
+            parted e2fsprogs openssl pigz
 
           echo "ARCH_RELEASE=${{ inputs.arch_release || 'aarch64' }}" >> "${GITHUB_ENV}"
           echo "ROOT_PASSWORD=${{ inputs.root_password   || '1234' }}"  >> "${GITHUB_ENV}"
           echo "HOSTNAME_VAL=${{ inputs.hostname         || 'arch' }}"   >> "${GITHUB_ENV}"
           echo "TZ_VAL=${{ inputs.timezone               || 'Asia/Shanghai' }}" >> "${GITHUB_ENV}"
-          echo "EXTRA_PKGS=${{ inputs.extra_packages     || '' }}"        >> "${GITHUB_ENV}"
           echo "status=success" >> "${GITHUB_OUTPUT}"
-
-      # ── 2. 合并磁盘空间 ───────────────────────────────────────────────
-      - name: Create build disk
-        if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
-        run: |
-          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 1)
-          root_size=$(expr $(df -h / | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 4)
-          sudo truncate -s "${mnt_size}G"  /mnt/mnt.img
-          sudo truncate -s "${root_size}G" /root.img
-          sudo losetup /dev/loop6 /mnt/mnt.img
-          sudo losetup /dev/loop7 /root.img
-          sudo pvcreate /dev/loop6 /dev/loop7
-          sudo vgcreate github /dev/loop6 /dev/loop7
-          sudo lvcreate -n runner -l 100%FREE github
-          sudo mkfs.xfs -f -i sparse=0 /dev/github/runner
-          sudo mkdir -p /builder
-          sudo mount /dev/github/runner /builder
-          sudo chown -R runner:runner /builder
-          echo "可用空间: $(df -h /builder | tail -1 | awk '{print $4}')"
 
       # ── 3. 构建 Arch rootfs ───────────────────────────────────────────
       # 下载 ALARM 官方 aarch64 rootfs tarball，chroot 进去装包 + 精简
@@ -294,12 +260,6 @@ jobs:
               rsync logrotate perl
           "
 
-          # ── 额外包 ────────────────────────────────────────────────────
-          if [[ -n "${EXTRA_PKGS}" ]]; then
-            echo "▶ 安装额外包: ${EXTRA_PKGS}"
-            sudo chroot "${ROOTFS_DIR}" pacman -Sy --noconfirm --needed ${EXTRA_PKGS}
-          fi
-
           echo "▶ 执行 pacman -Syu 全量更新..."
           sudo chroot "${ROOTFS_DIR}" pacman -Syu --noconfirm --needed
 
@@ -386,11 +346,18 @@ jobs:
 
             systemctl disable systemd-pstore.service             2>/dev/null || true
             systemctl enable systemd-networkd.service
+            systemctl enable systemd-resolved.service
           "
+
+          # ── 有线 DHCP（systemd-networkd）+ resolv.conf → resolved stub ──
+          sudo mkdir -p "${ROOTFS_DIR}/etc/systemd/network"
+          printf '[Match]\nName=en* eth*\n\n[Network]\nDHCP=yes\nIPv6AcceptRA=yes\n\n[DHCPv4]\nUseDomains=yes\n' \
+            | sudo tee "${ROOTFS_DIR}/etc/systemd/network/20-wired.network" > /dev/null
 
           # ── 卸载 chroot 挂载点 ────────────────────────────────────────
           umount_chroot
           trap - EXIT
+          sudo ln -sf ../run/systemd/resolve/stub-resolv.conf "${ROOTFS_DIR}/etc/resolv.conf"
 
           # ── 恢复 /etc/pacman.conf → 面向最终用户的官方 GeoIP 镜像 ──
           sudo tee "${ROOTFS_DIR}/etc/pacman.conf" > /dev/null << 'PACMAN_USER_EOF'
@@ -472,7 +439,7 @@ jobs:
           echo "BUILT_DATE=${BUILT_DATE}" >> "${GITHUB_OUTPUT}"
           echo "status=success"           >> "${GITHUB_OUTPUT}"
 
-      # ── 5. 将 rootfs 打包成 rebuild 脚本可直接识别的 "*.img.xz" 镜像 ──
+      # ── 5. 将 rootfs 打包成 rebuild 脚本可直接识别的 "*.img.gz" 镜像 ──
       #        产物文件名使用发行版名称 + 版本信息，不再伪装为 Armbian 镜像 ──
       - name: Package rootfs into an image
         id: wrap_image
@@ -516,20 +483,20 @@ jobs:
           sudo umount "${MNT}"
           sudo losetup -d "${LOOPDEV}"
 
-          echo "▶ 压缩镜像 (xz)..."
-          xz -T0 -9 -f "${IMG_PATH}"
+          echo "▶ 压缩镜像 (gzip)..."
+          pigz -9 -f "${IMG_PATH}"
 
           OUT_DIR="${GITHUB_WORKSPACE}/output"
           mkdir -p "${OUT_DIR}"
-          mv -f "${IMG_PATH}.xz" "${OUT_DIR}/"
-          IMG_XZ_NAME="${IMG_NAME}.xz"
+          mv -f "${IMG_PATH}.gz" "${OUT_DIR}/"
+          IMG_GZ_NAME="${IMG_NAME}.gz"
 
           cd "${OUT_DIR}"
-          sha256sum "${IMG_XZ_NAME}" > "${IMG_XZ_NAME}.sha256"
+          sha256sum "${IMG_GZ_NAME}" > "${IMG_GZ_NAME}.sha256"
 
-          echo "IMG_XZ_NAME=${IMG_XZ_NAME}" >> "${GITHUB_OUTPUT}"
-          echo "IMG_XZ_PATH=${OUT_DIR}/${IMG_XZ_NAME}" >> "${GITHUB_OUTPUT}"
-          echo "IMG_XZ_SHA256_PATH=${OUT_DIR}/${IMG_XZ_NAME}.sha256" >> "${GITHUB_OUTPUT}"
+          echo "IMG_GZ_NAME=${IMG_GZ_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "IMG_GZ_PATH=${OUT_DIR}/${IMG_GZ_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "IMG_GZ_SHA256_PATH=${OUT_DIR}/${IMG_GZ_NAME}.sha256" >> "${GITHUB_OUTPUT}"
           echo "status=success" >> "${GITHUB_OUTPUT}"
 
       # ── 6. 发布 rootfs 到 Release ────────────────────────────────────
@@ -541,6 +508,6 @@ jobs:
           name: "rootfs"
           prerelease: true
           artifacts: |
-            ${{ steps.wrap_image.outputs.IMG_XZ_PATH }}
+            ${{ steps.wrap_image.outputs.IMG_GZ_PATH }}
           allowUpdates: true
           token: ${{ secrets.GITHUB_TOKEN }}

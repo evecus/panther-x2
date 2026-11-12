@@ -54,6 +54,7 @@ jobs:
             btrfs-progs \
             e2fsprogs \
             xz-utils \
+            pigz \
             openssl \
             rsync \
             curl \
@@ -386,7 +387,7 @@ jobs:
             rmdir "${MNT}"
 
             sudo chown "$(id -u):$(id -g)" "${IMG}"
-            xz -T0 -f "${IMG}"
+            pigz -9 -f "${IMG}"
           else
             IMG="${OUTPUT_DIR}/nixos-aarch64-rootfs.btrfs.img"
             truncate -s "${SIZE_MB}M" "${IMG}"
@@ -400,12 +401,12 @@ jobs:
             rmdir "${MNT}"
 
             sudo chown "$(id -u):$(id -g)" "${IMG}"
-            xz -T0 -f "${IMG}"
+            pigz -9 -f "${IMG}"
           fi
 
           sha256sum "${OUTPUT_DIR}"/* > "${OUTPUT_DIR}/SHA256SUMS"
           ls -lh "${OUTPUT_DIR}"
-          mv  ${{ runner.temp }}/nixos-output/nixos-aarch64-rootfs.*.img.xz  ${{ runner.temp }}/nixos-output/NixOS-aarch64-rootfs.img.xz
+          mv  ${{ runner.temp }}/nixos-output/nixos-aarch64-rootfs.*.img.gz  ${{ runner.temp }}/nixos-output/NixOS-aarch64-rootfs.img.gz
 
       - name: Create release
         if: success()
@@ -414,4 +415,4 @@ jobs:
           tag_name: rootfs
           name: rootfs
           files: |
-            ${{ runner.temp }}/nixos-output/NixOS-aarch64-rootfs.img.xz
+            ${{ runner.temp }}/nixos-output/NixOS-aarch64-rootfs.img.gz

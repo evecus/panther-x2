@@ -38,7 +38,7 @@ on:
 env:
   TZ: UTC
   UBUNTU_MIRROR: "http://ports.ubuntu.com/ubuntu-ports"
-  ROOTFS_DIR: /builder/ubuntu-rootfs
+  ROOTFS_DIR: /opt/ubuntu-rootfs
 
 jobs:
   build:
@@ -57,30 +57,16 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          docker rmi -f $(docker images -q) 2>/dev/null || true
-          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
-          sudo swapoff -a && sudo rm -f /swapfile /mnt/swapfile
-
           sudo -E apt-get -y update
-          sudo -E apt-get -y purge \
-            azure-cli ghc* zulu* llvm* firefox google* dotnet* \
-            powershell openjdk* mongodb* moby* 2>/dev/null || true
           sudo -E apt-get -y install \
             debootstrap \
-            parted e2fsprogs dosfstools btrfs-progs \
-            u-boot-tools uuid-runtime openssl pigz \
-            git curl wget xz-utils lz4 zstd pv jq rsync
-          sudo -E apt-get -y autoremove --purge
-          sudo -E apt-get clean
-          sudo -E timedatectl set-timezone "${TZ}"
+            parted e2fsprogs openssl pigz
 
           UBUNTU_RELEASE="${{ inputs.ubuntu_release || 'noble' }}"
           echo "UBUNTU_RELEASE=${UBUNTU_RELEASE}"                      >> "${GITHUB_ENV}"
           echo "ROOT_PASSWORD=${{ inputs.root_password   || '1234' }}" >> "${GITHUB_ENV}"
           echo "HOSTNAME_VAL=${{ inputs.hostname         || 'ubuntu' }}" >> "${GITHUB_ENV}"
           echo "TZ_VAL=${{ inputs.timezone               || 'Asia/Shanghai' }}" >> "${GITHUB_ENV}"
-          echo "EXTRA_PKGS=${{ inputs.extra_packages     || '' }}"       >> "${GITHUB_ENV}"
 
           # jammy / noble / resolute 专有标志
           if [[ "${UBUNTU_RELEASE}" == "jammy" ]]; then
@@ -94,25 +80,6 @@ jobs:
             echo "IS_RESOLUTE=false" >> "${GITHUB_ENV}"
           fi
           echo "status=success" >> "${GITHUB_OUTPUT}"
-
-      # ── 2. 合并磁盘空间 ───────────────────────────────────────────────
-      - name: Create build disk
-        if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
-        run: |
-          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 1)
-          root_size=$(expr $(df -h / | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 4)
-          sudo truncate -s "${mnt_size}G"  /mnt/mnt.img
-          sudo truncate -s "${root_size}G" /root.img
-          sudo losetup /dev/loop6 /mnt/mnt.img
-          sudo losetup /dev/loop7 /root.img
-          sudo pvcreate /dev/loop6 /dev/loop7
-          sudo vgcreate github /dev/loop6 /dev/loop7
-          sudo lvcreate -n runner -l 100%FREE github
-          sudo mkfs.xfs -f -i sparse=0 /dev/github/runner
-          sudo mkdir -p /builder
-          sudo mount /dev/github/runner /builder
-          sudo chown -R runner:runner /builder
-          echo "可用空间: $(df -h /builder | tail -1 | awk '{print $4}')"
 
       # ── 3. 构建 Ubuntu rootfs ─────────────────────────────────────────
       - name: Build Ubuntu rootfs
@@ -189,7 +156,7 @@ jobs:
               apt-get install -y \
                 openssh-server sudo curl wget ca-certificates \
                 locales tzdata fdisk binutils \
-                iproute2 network-manager netplan.io \
+                iproute2 netplan.io \
                 net-tools iputils-ping dnsutils \
                 wireless-tools chrony bluez \
                 bash-completion htop nano nftables bc \
@@ -213,7 +180,7 @@ jobs:
               apt-get install -y \
                 openssh-server sudo curl wget ca-certificates \
                 locales tzdata fdisk \
-                iproute2 network-manager netplan.io \
+                iproute2 netplan.io systemd-resolved \
                 net-tools iputils-ping dnsutils \
                 ${WT_PKG} chrony \
                 bash-completion htop nano nftables bc \
@@ -251,32 +218,24 @@ jobs:
           ROOT_HASH="$(openssl passwd -6 "${ROOT_PASSWORD}")"
           sudo sed -i "s|^root:[^:]*|root:${ROOT_HASH}|" "${ROOTFS_DIR}/etc/shadow"
 
-          # ── 网络（NetworkManager + netplan）──────────────────────────
-          sudo mkdir -p "${ROOTFS_DIR}/etc/NetworkManager"
-          echo 'W21haW5dCnBsdWdpbnM9aWZ1cGRvd24sa2V5ZmlsZQpkaGNwPWludGVybmFsCltpZnVwZG93bl0KbWFuYWdlZD10cnVlCg==' \
-            | base64 -d | sudo tee "${ROOTFS_DIR}/etc/NetworkManager/NetworkManager.conf" > /dev/null
+          # ── 网络（systemd-networkd + netplan，不装 NetworkManager）────
           sudo mkdir -p "${ROOTFS_DIR}/etc/netplan"
-          sudo tee "${ROOTFS_DIR}/etc/netplan/01-nm-all.yaml" > /dev/null << 'NETPLAN_EOF'
-          network:
-            version: 2
-            renderer: NetworkManager
-          NETPLAN_EOF
-          sudo sed -i 's/^[[:space:]]*//' "${ROOTFS_DIR}/etc/netplan/01-nm-all.yaml"
-          sudo chmod 600 "${ROOTFS_DIR}/etc/netplan/01-nm-all.yaml"
+          printf 'network:\n  version: 2\n  renderer: networkd\n  ethernets:\n    all-en:\n      match:\n        name: "en*"\n      dhcp4: true\n      dhcp6: true\n    all-eth:\n      match:\n        name: "eth*"\n      dhcp4: true\n      dhcp6: true\n' \
+            | sudo tee "${ROOTFS_DIR}/etc/netplan/01-netcfg.yaml" > /dev/null
+          sudo chmod 600 "${ROOTFS_DIR}/etc/netplan/01-netcfg.yaml"
 
           # ── enable 基础系统服务（平台脚本/服务由 rebuild 阶段统一注入）──
           # Ubuntu 多为 ssh.service；个别版本只有 sshd.service
           sudo chroot "${ROOTFS_DIR}" bash -c \
             'systemctl enable ssh 2>/dev/null || systemctl enable sshd'
-          sudo chroot "${ROOTFS_DIR}" systemctl enable NetworkManager
-          sudo chroot "${ROOTFS_DIR}" systemctl enable NetworkManager-dispatcher
+          sudo chroot "${ROOTFS_DIR}" systemctl enable systemd-networkd
+          sudo chroot "${ROOTFS_DIR}" systemctl enable systemd-resolved
           sudo chroot "${ROOTFS_DIR}" systemctl enable chrony
           sudo chroot "${ROOTFS_DIR}" systemctl enable nftables
 
           # ── Ubuntu 特有：禁用 snapd / unattended-upgrades ────────────
           sudo chroot "${ROOTFS_DIR}" bash -c "
             systemctl disable snapd.service snapd.socket snapd.seeded.service 2>/dev/null || true
-            systemctl disable systemd-networkd
             apt-mark hold snapd 2>/dev/null || true
             systemctl disable unattended-upgrades.service 2>/dev/null || true
             systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
@@ -306,10 +265,9 @@ jobs:
 
           # ── disable 不需要的服务 ──────────────────────────────────────
           sudo chroot "${ROOTFS_DIR}" systemctl disable networking.service                 2>/dev/null || true
-          sudo chroot "${ROOTFS_DIR}" systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
+          sudo chroot "${ROOTFS_DIR}" systemctl disable systemd-networkd-wait-online.service 2>/dev/null || true
           sudo chroot "${ROOTFS_DIR}" systemctl disable e2scrub_reap.service               2>/dev/null || true
           sudo chroot "${ROOTFS_DIR}" systemctl disable systemd-pstore.service             2>/dev/null || true
-          sudo chroot "${ROOTFS_DIR}" systemctl disable systemd-networkd.service           2>/dev/null || true
 
           # ── uInitrd 钩子 ──────────────────────────────────────────────
           sudo mkdir -p "${ROOTFS_DIR}/etc/initramfs/post-update.d"
@@ -333,6 +291,9 @@ jobs:
             | sudo tee -a "${ROOTFS_DIR}/etc/fstab" > /dev/null
 
           sudo mkdir -p "${ROOTFS_DIR}/usr/lib/modules"
+
+          # ── resolv.conf → systemd-resolved stub（放在最后，前面 chroot 装包仍需 DNS）──
+          sudo ln -sf ../run/systemd/resolve/stub-resolv.conf "${ROOTFS_DIR}/etc/resolv.conf"
 
           echo "▶ rootfs 完成: $(sudo du -sh ${ROOTFS_DIR} | awk '{print $1}')"
           echo "status=success" >> "${GITHUB_OUTPUT}"
@@ -362,7 +323,7 @@ jobs:
           echo "BUILT_DATE=${BUILT_DATE}" >> "${GITHUB_OUTPUT}"
           echo "status=success"           >> "${GITHUB_OUTPUT}"
 
-      # ── 5. 打包成 rebuild 可识别的 *.img.xz ──────────────────────────
+      # ── 5. 打包成 rebuild 可识别的 *.img.gz ──────────────────────────
       - name: Package rootfs into an image
         id: wrap_image
         if: ${{ steps.package_rootfs.outputs.status == 'success' && !cancelled() }}
@@ -401,20 +362,20 @@ jobs:
           sudo umount "${MNT}"
           sudo losetup -d "${LOOPDEV}"
 
-          echo "▶ 压缩镜像 (xz)..."
-          xz -T0 -9 -f "${IMG_PATH}"
+          echo "▶ 压缩镜像 (gzip)..."
+          pigz -9 -f "${IMG_PATH}"
 
           OUT_DIR="${GITHUB_WORKSPACE}/output"
           mkdir -p "${OUT_DIR}"
-          mv -f "${IMG_PATH}.xz" "${OUT_DIR}/"
-          IMG_XZ_NAME="${IMG_NAME}.xz"
+          mv -f "${IMG_PATH}.gz" "${OUT_DIR}/"
+          IMG_GZ_NAME="${IMG_NAME}.gz"
 
           cd "${OUT_DIR}"
-          sha256sum "${IMG_XZ_NAME}" > "${IMG_XZ_NAME}.sha256"
+          sha256sum "${IMG_GZ_NAME}" > "${IMG_GZ_NAME}.sha256"
 
-          echo "IMG_XZ_NAME=${IMG_XZ_NAME}"           >> "${GITHUB_OUTPUT}"
-          echo "IMG_XZ_PATH=${OUT_DIR}/${IMG_XZ_NAME}" >> "${GITHUB_OUTPUT}"
-          echo "IMG_XZ_SHA256_PATH=${OUT_DIR}/${IMG_XZ_NAME}.sha256" >> "${GITHUB_OUTPUT}"
+          echo "IMG_GZ_NAME=${IMG_GZ_NAME}"           >> "${GITHUB_OUTPUT}"
+          echo "IMG_GZ_PATH=${OUT_DIR}/${IMG_GZ_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "IMG_GZ_SHA256_PATH=${OUT_DIR}/${IMG_GZ_NAME}.sha256" >> "${GITHUB_OUTPUT}"
           echo "status=success" >> "${GITHUB_OUTPUT}"
 
       # ── 6. 发布到 Release (tag: rootfs) ──────────────────────────────
@@ -426,6 +387,6 @@ jobs:
           name: "rootfs"
           prerelease: true
           artifacts: |
-            ${{ steps.wrap_image.outputs.IMG_XZ_PATH }}
+            ${{ steps.wrap_image.outputs.IMG_GZ_PATH }}
           allowUpdates: true
           token: ${{ secrets.GITHUB_TOKEN }}

@@ -13,15 +13,6 @@ on:
           - "44"
           - "43"
 
-      armbian_fstype:
-        description: "rootfs 文件系统类型"
-        required: false
-        default: "ext4"
-        type: choice
-        options:
-          - ext4
-          - btrfs
-
       root_password:
         description: "root 密码（仅自建 rootfs 时生效）"
         required: false
@@ -44,7 +35,7 @@ on:
 env:
   TZ: UTC
   FEDORA_MIRROR: "https://dl.fedoraproject.org/pub/fedora/linux"
-  ROOTFS_DIR: /builder/fedora-rootfs
+  ROOTFS_DIR: /opt/fedora-rootfs
 
 jobs:
   build:
@@ -61,59 +52,18 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          docker rmi -f $(docker images -q) 2>/dev/null || true
-          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
-          sudo swapoff -a && sudo rm -f /swapfile /mnt/swapfile
           sudo -E apt-get -y update
-          sudo -E apt-get -y purge \
-            azure-cli ghc* zulu* llvm* firefox google* dotnet* \
-            powershell openjdk* mongodb* moby* 2>/dev/null || true
           sudo -E apt-get -y install \
-            dnf rpm qemu-user-static \
-            parted e2fsprogs dosfstools btrfs-progs \
-            u-boot-tools uuid-runtime openssl pigz \
-            git curl wget xz-utils lz4 zstd pv jq rsync
-          sudo -E apt-get -y autoremove --purge
-          sudo -E apt-get clean
-          sudo -E timedatectl set-timezone "${TZ}"
+            dnf rpm \
+            parted e2fsprogs openssl pigz
           # 写入运行时变量
           echo "FEDORA_RELEASE=${{ inputs.fedora_release || '43' }}" >> "${GITHUB_ENV}"
           echo "ROOT_PASSWORD=${{ inputs.root_password   || '1234' }}"     >> "${GITHUB_ENV}"
           echo "HOSTNAME_VAL=${{ inputs.hostname         || 'fedora' }}"   >> "${GITHUB_ENV}"
           echo "TZ_VAL=${{ inputs.timezone               || 'Asia/Shanghai' }}" >> "${GITHUB_ENV}"
-          echo "EXTRA_PKGS=${{ inputs.extra_packages     || '' }}"          >> "${GITHUB_ENV}"
-          # 判断模式：有 rootfs_url → 跳过构建
-          ROOTFS_URL="${{ inputs.rootfs_url }}"
-          if [[ -n "${ROOTFS_URL}" ]]; then
-            echo "BUILD_ROOTFS=false" >> "${GITHUB_ENV}"
-            echo "ROOTFS_URL=${ROOTFS_URL}" >> "${GITHUB_ENV}"
-            echo "▶ 模式：使用已有 rootfs → ${ROOTFS_URL}"
-          else
-            echo "BUILD_ROOTFS=true"  >> "${GITHUB_ENV}"
-            echo "ROOTFS_URL="        >> "${GITHUB_ENV}"
-            echo "▶ 模式：自建 rootfs"
-          fi
           echo "status=success" >> "${GITHUB_OUTPUT}"
-      # ── 2. 合并磁盘空间 ───────────────────────────────────────────────
-      - name: Create build disk
-        if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
-        run: |
-          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 1)
-          root_size=$(expr $(df -h / | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 4)
-          sudo truncate -s "${mnt_size}G"  /mnt/mnt.img
-          sudo truncate -s "${root_size}G" /root.img
-          sudo losetup /dev/loop6 /mnt/mnt.img
-          sudo losetup /dev/loop7 /root.img
-          sudo pvcreate /dev/loop6 /dev/loop7
-          sudo vgcreate github /dev/loop6 /dev/loop7
-          sudo lvcreate -n runner -l 100%FREE github
-          sudo mkfs.xfs -f -i sparse=0 /dev/github/runner
-          sudo mkdir -p /builder
-          sudo mount /dev/github/runner /builder
-          sudo chown -R runner:runner /builder
-          echo "可用空间: $(df -h /builder | tail -1 | awk '{print $4}')"
-      # ── 3A. 自建 rootfs（rootfs_url 为空时执行）──────────────────────
+
+      # ── 3A. 构建 rootfs ──────────────────────────────────────────────
       - name: Build Fedora rootfs
         id: build_rootfs
         run: |
@@ -138,7 +88,7 @@ jobs:
             systemd systemd-udev passwd util-linux \
             openssh-server sudo curl wget curl-minimal ca-certificates \
             glibc-langpack-en tzdata \
-            iproute NetworkManager NetworkManager-wifi \
+            iproute systemd-networkd systemd-resolved \
             net-tools iputils bind-utils \
             iw wpa_supplicant chrony bc \
             bash-completion htop nano firewalld \
@@ -146,21 +96,8 @@ jobs:
             btrfs-progs e2fsprogs dosfstools \
             lsof file procps-ng cronie util-linux-user \
             rsync
-          # ── 额外包 ────────────────────────────────────────────────────
-          if [[ -n "${EXTRA_PKGS}" ]]; then
-            echo "▶ 安装额外包: ${EXTRA_PKGS}"
-            sudo dnf -y \
-              --releasever="${FEDORA_RELEASE}" \
-              --installroot="${ROOTFS_DIR}" \
-              --setopt=reposdir=/dev/null \
-              --repofrompath="fedora,${FEDORA_MIRROR}/releases/${FEDORA_RELEASE}/Everything/aarch64/os/" \
-              --repofrompath="updates,${FEDORA_MIRROR}/updates/${FEDORA_RELEASE}/Everything/aarch64/" \
-              --repo=fedora --repo=updates \
-              --nogpgcheck \
-              install ${EXTRA_PKGS}
-          fi
           # 验证关键包
-          sudo rpm --root="${ROOTFS_DIR}" -q openssh-server NetworkManager rsync || {
+          sudo rpm --root="${ROOTFS_DIR}" -q openssh-server systemd-networkd rsync || {
             echo 'ERROR: 关键包安装不完整'
             exit 1
           }
@@ -184,15 +121,20 @@ jobs:
             sudo sed -i "s|^#*DefaultTimeoutStartSec.*|DefaultTimeoutStartSec=10s|g" "${SYS_CONF}"
             sudo sed -i "s|^#*DefaultTimeoutStopSec.*|DefaultTimeoutStopSec=10s|g"   "${SYS_CONF}"
           } || true
+          # ── 网络：systemd-networkd 有线 DHCP + resolved ───────────────
+          sudo mkdir -p "${ROOTFS_DIR}/etc/systemd/network"
+          printf '[Match]\nName=en* eth*\n\n[Network]\nDHCP=yes\nIPv6AcceptRA=yes\n\n[DHCPv4]\nUseDomains=yes\n' \
+            | sudo tee "${ROOTFS_DIR}/etc/systemd/network/20-wired.network" > /dev/null
+          sudo ln -sf ../run/systemd/resolve/stub-resolv.conf "${ROOTFS_DIR}/etc/resolv.conf"
           # ── enable 服务 ───────────────────────────────────────────────
           sudo chroot "${ROOTFS_DIR}" systemctl enable sshd
-          sudo chroot "${ROOTFS_DIR}" systemctl enable NetworkManager
+          sudo chroot "${ROOTFS_DIR}" systemctl enable systemd-networkd
+          sudo chroot "${ROOTFS_DIR}" systemctl enable systemd-resolved
           sudo chroot "${ROOTFS_DIR}" systemctl enable chronyd
           sudo chroot "${ROOTFS_DIR}" systemctl enable firewalld 2>/dev/null || true
           # ── disable 不需要的服务 ──────────────────────────────────────
-          sudo chroot "${ROOTFS_DIR}" systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
+          sudo chroot "${ROOTFS_DIR}" systemctl disable systemd-networkd-wait-online.service 2>/dev/null || true
           sudo chroot "${ROOTFS_DIR}" systemctl disable e2scrub_reap.service              2>/dev/null || true
-          sudo chroot "${ROOTFS_DIR}" systemctl disable systemd-networkd.service 2>/dev/null || true
           sudo chroot "${ROOTFS_DIR}" systemctl disable systemd-pstore.service            2>/dev/null || true
           # ── uInitrd（dracut 版）──────────────────────────────────────
           # Fedora 用 dracut 而非 initramfs-tools/mkinitramfs，钩子机制不同：
@@ -226,7 +168,7 @@ jobs:
           echo "BUILT_DATE=${BUILT_DATE}" >> "${GITHUB_OUTPUT}"
           echo "status=success"           >> "${GITHUB_OUTPUT}"
 
-      # ── 3C. 将 rootfs 打包成 rebuild 脚本可直接识别的 "*.img.xz" 镜像 ──
+      # ── 3C. 将 rootfs 打包成 rebuild 脚本可直接识别的 "*.img.gz" 镜像 ──
       #        产物文件名使用发行版名称 + 版本信息，不再伪装为 Armbian 镜像 ──
       - name: Package rootfs into an image
         id: wrap_image
@@ -269,19 +211,19 @@ jobs:
           sudo umount "${MNT}"
           sudo losetup -d "${LOOPDEV}"
 
-          echo "▶ 压缩镜像 (xz)..."
-          xz -T0 -9 -f "${IMG_PATH}"
+          echo "▶ 压缩镜像 (gzip)..."
+          pigz -9 -f "${IMG_PATH}"
 
           OUT_DIR="${GITHUB_WORKSPACE}/output"
           mkdir -p "${OUT_DIR}"
-          mv -f "${IMG_PATH}.xz" "${OUT_DIR}/"
-          IMG_XZ_NAME="${IMG_NAME}.xz"
+          mv -f "${IMG_PATH}.gz" "${OUT_DIR}/"
+          IMG_GZ_NAME="${IMG_NAME}.gz"
 
           cd "${OUT_DIR}"
-          sha256sum "${IMG_XZ_NAME}" > "${IMG_XZ_NAME}.sha256"
+          sha256sum "${IMG_GZ_NAME}" > "${IMG_GZ_NAME}.sha256"
 
-          echo "IMG_XZ_NAME=${IMG_XZ_NAME}"           >> "${GITHUB_OUTPUT}"
-          echo "IMG_XZ_PATH=${OUT_DIR}/${IMG_XZ_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "IMG_GZ_NAME=${IMG_GZ_NAME}"           >> "${GITHUB_OUTPUT}"
+          echo "IMG_GZ_PATH=${OUT_DIR}/${IMG_GZ_NAME}" >> "${GITHUB_OUTPUT}"
           echo "OUT_DIR=${OUT_DIR}"                    >> "${GITHUB_OUTPUT}"
           echo "status=success"                        >> "${GITHUB_OUTPUT}"
 
@@ -292,6 +234,6 @@ jobs:
           name: "rootfs"
           prerelease: true
           artifacts: |
-            ${{ steps.wrap_image.outputs.OUT_DIR }}/${{ steps.wrap_image.outputs.IMG_XZ_NAME }}
+            ${{ steps.wrap_image.outputs.OUT_DIR }}/${{ steps.wrap_image.outputs.IMG_GZ_NAME }}
           allowUpdates: true
           token: ${{ secrets.GITHUB_TOKEN }}

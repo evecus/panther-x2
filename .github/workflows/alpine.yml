@@ -58,7 +58,7 @@ on:
 
 env:
   TZ: UTC
-  ROOTFS_DIR: /builder/alpine-rootfs
+  ROOTFS_DIR: /opt/alpine-rootfs
 
 jobs:
   build:
@@ -77,22 +77,10 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          docker rmi -f $(docker images -q) 2>/dev/null || true
-          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
-          sudo swapoff -a && sudo rm -f /swapfile /mnt/swapfile
-
           sudo -E apt-get -y update
-          sudo -E apt-get -y purge \
-            azure-cli ghc* zulu* llvm* firefox google* dotnet* \
-            powershell openjdk* mongodb* moby* 2>/dev/null || true
           sudo -E apt-get -y install \
-            parted e2fsprogs dosfstools btrfs-progs \
-            u-boot-tools uuid-runtime openssl pigz \
-            git curl wget xz-utils lz4 zstd pv jq rsync
-          sudo -E apt-get -y autoremove --purge
-          sudo -E apt-get clean
-          sudo -E timedatectl set-timezone "${TZ}"
+            curl \
+            parted e2fsprogs openssl pigz
 
           echo "ALPINE_RELEASE=${{ inputs.alpine_release || 'edge' }}" >> "${GITHUB_ENV}"
           echo "ROOT_PASSWORD=${{ inputs.root_password   || '1234' }}"   >> "${GITHUB_ENV}"
@@ -100,25 +88,6 @@ jobs:
           echo "TZ_VAL=${{ inputs.timezone               || 'Asia/Shanghai' }}" >> "${GITHUB_ENV}"
           echo "EXTRA_PKGS=${{ inputs.extra_packages     || '' }}"         >> "${GITHUB_ENV}"
           echo "status=success" >> "${GITHUB_OUTPUT}"
-
-      # ── 2. 合并磁盘空间 ───────────────────────────────────────────────
-      - name: Create build disk
-        if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
-        run: |
-          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 1)
-          root_size=$(expr $(df -h / | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 4)
-          sudo truncate -s "${mnt_size}G"  /mnt/mnt.img
-          sudo truncate -s "${root_size}G" /root.img
-          sudo losetup /dev/loop6 /mnt/mnt.img
-          sudo losetup /dev/loop7 /root.img
-          sudo pvcreate /dev/loop6 /dev/loop7
-          sudo vgcreate github /dev/loop6 /dev/loop7
-          sudo lvcreate -n runner -l 100%FREE github
-          sudo mkfs.xfs -f -i sparse=0 /dev/github/runner
-          sudo mkdir -p /builder
-          sudo mount /dev/github/runner /builder
-          sudo chown -R runner:runner /builder
-          echo "可用空间: $(df -h /builder | tail -1 | awk '{print $4}')"
 
       # ── 3. 构建 Alpine rootfs ─────────────────────────────────────────
       # 下载官方 aarch64 mini rootfs，chroot 进去 apk 装包 + 精简
@@ -253,7 +222,7 @@ jobs:
           # ── 安装基础包 ────────────────────────────────────────────────
           # Alpine 包名注意：
           #   - openssh (非 openssh-server)
-          #   - networkmanager (NM 在 community 仓库)
+          #   - 联网用 busybox 自带的 ifupdown + udhcpc（networking 服务），无需 NetworkManager
           #   - openrc (Alpine 默认 init，已预装)
           #   - busybox-suid (提供 ping 等需要 capability 的工具)
           echo "▶ 安装基础软件包..."
@@ -266,11 +235,6 @@ jobs:
               wget \
               ca-certificates \
               tzdata \
-              networkmanager \
-              networkmanager-cli \
-              networkmanager-tui \
-              networkmanager-wifi \
-              networkmanager-ppp \
               iptables \
               iproute2 \
               iputils \
@@ -305,7 +269,7 @@ jobs:
               nftables
 
             # 验证关键包
-            for p in openssh networkmanager rsync perl; do
+            for p in openssh wpa_supplicant rsync perl; do
               apk -e info \${p} >/dev/null 2>&1 || { echo \"ERROR: 关键包 \${p} 安装失败\"; exit 1; }
             done
           "
@@ -340,26 +304,19 @@ jobs:
           ROOT_HASH="$(openssl passwd -6 "${ROOT_PASSWORD}")"
           sudo sed -i "s|^root:[^:]*|root:${ROOT_HASH}|" "${ROOTFS_DIR}/etc/shadow"
 
-          # ── NetworkManager 配置 ───────────────────────────────────────
-          sudo mkdir -p "${ROOTFS_DIR}/etc/NetworkManager"
-          sudo tee "${ROOTFS_DIR}/etc/NetworkManager/NetworkManager.conf" > /dev/null << 'NM_EOF'
-          [main]
-          plugins=keyfile
-          dhcp=internal
-          [keyfile]
-          unmanaged-devices=none
-          NM_EOF
-          sudo sed -i 's/^[[:space:]]*//' "${ROOTFS_DIR}/etc/NetworkManager/NetworkManager.conf"
+          # ── 网络：busybox ifupdown + udhcpc（有线 DHCP）────────────────
+          sudo mkdir -p "${ROOTFS_DIR}/etc/network"
+          printf 'auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp\n' \
+            | sudo tee "${ROOTFS_DIR}/etc/network/interfaces" > /dev/null
 
           # ── enable 基础系统服务（OpenRC）──────────────────────────────
           # 平台脚本/服务由 rebuild 阶段统一注入（common-* OpenRC init 脚本）
           sudo chroot "${ROOTFS_DIR}" /bin/sh -c "
             # 基础系统服务
             rc-update add sshd default
-            rc-update add networkmanager default
             rc-update add nftables default
             rc-update add chronyd default
-            rc-update add networking boot 2>/dev/null || true
+            rc-update add networking boot
 
             # 硬件相关
             rc-update add devfs sysinit 2>/dev/null || true
@@ -445,7 +402,7 @@ jobs:
           echo "BUILT_DATE=${BUILT_DATE}" >> "${GITHUB_OUTPUT}"
           echo "status=success"           >> "${GITHUB_OUTPUT}"
 
-      # ── 5. 将 rootfs 打包成 rebuild 脚本可直接识别的 "*.img.xz" 镜像 ──
+      # ── 5. 将 rootfs 打包成 rebuild 脚本可直接识别的 "*.img.gz" 镜像 ──
       #        产物文件名使用发行版名称 + 版本信息，不再伪装为 Armbian 镜像 ──
       - name: Package rootfs into an image
         id: wrap_image
@@ -489,20 +446,20 @@ jobs:
           sudo umount "${MNT}"
           sudo losetup -d "${LOOPDEV}"
 
-          echo "▶ 压缩镜像 (xz)..."
-          xz -T0 -9 -f "${IMG_PATH}"
+          echo "▶ 压缩镜像 (gzip)..."
+          pigz -9 -f "${IMG_PATH}"
 
           OUT_DIR="${GITHUB_WORKSPACE}/output"
           mkdir -p "${OUT_DIR}"
-          mv -f "${IMG_PATH}.xz" "${OUT_DIR}/"
-          IMG_XZ_NAME="${IMG_NAME}.xz"
+          mv -f "${IMG_PATH}.gz" "${OUT_DIR}/"
+          IMG_GZ_NAME="${IMG_NAME}.gz"
 
           cd "${OUT_DIR}"
-          sha256sum "${IMG_XZ_NAME}" > "${IMG_XZ_NAME}.sha256"
+          sha256sum "${IMG_GZ_NAME}" > "${IMG_GZ_NAME}.sha256"
 
-          echo "IMG_XZ_NAME=${IMG_XZ_NAME}" >> "${GITHUB_OUTPUT}"
-          echo "IMG_XZ_PATH=${OUT_DIR}/${IMG_XZ_NAME}" >> "${GITHUB_OUTPUT}"
-          echo "IMG_XZ_SHA256_PATH=${OUT_DIR}/${IMG_XZ_NAME}.sha256" >> "${GITHUB_OUTPUT}"
+          echo "IMG_GZ_NAME=${IMG_GZ_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "IMG_GZ_PATH=${OUT_DIR}/${IMG_GZ_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "IMG_GZ_SHA256_PATH=${OUT_DIR}/${IMG_GZ_NAME}.sha256" >> "${GITHUB_OUTPUT}"
           echo "status=success" >> "${GITHUB_OUTPUT}"
 
       # ── 6. 发布 rootfs 到 Release ────────────────────────────────────
@@ -514,6 +471,6 @@ jobs:
           name: "rootfs"
           prerelease: true
           artifacts: |
-            ${{ steps.wrap_image.outputs.IMG_XZ_PATH }}
+            ${{ steps.wrap_image.outputs.IMG_GZ_PATH }}
           allowUpdates: true
           token: ${{ secrets.GITHUB_TOKEN }}
