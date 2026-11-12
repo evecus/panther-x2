@@ -1,8 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-KERNEL_DEB_URL="${KERNEL_DEB_URL:?需要 KERNEL_DEB_URL}"
-ROOTFS_URL="${ROOTFS_URL:?需要 ROOTFS_URL}"
+# 链接输入(可选): 有链接则直接用链接下载; 为空则去本仓库 release 按下列条件查找
+KERNEL_DEB_URL="${KERNEL_DEB_URL:-}"
+ROOTFS_URL="${ROOTFS_URL:-}"
+DISTRO="${DISTRO:-}"                    # debian/ubuntu/alpine/fedora/archlinux/opensuse/void/openwrt/nixos
+DISTRO_VERSION="${DISTRO_VERSION:-}"    # 如 bookworm / noble / 44 / leap156 ; 留空=取该发行版最新上传的
+KERNEL_VERSION="${KERNEL_VERSION:-}"    # 如 7.3.8 ; 留空=取最新
+REPO="${REPO:-${GITHUB_REPOSITORY:-}}"  # owner/repo
+GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+ROOTFS_TAG="${ROOTFS_TAG:-rootfs}"
+KERNEL_TAG="${KERNEL_TAG:-kernel}"
 ROOT_MB="${ROOT_MB:-2560}"
 ROOT_PASS="${ROOT_PASS:-1234}"
 SSH_PUBKEY="${SSH_PUBKEY:-}"
@@ -17,6 +25,40 @@ have() { command -v "$1" >/dev/null 2>&1; }
 [[ $(id -u) -eq 0 ]] || { echo "需要 root"; exit 1; }
 have openssl || { echo "需要 openssl"; exit 1; }
 
+# ── 从本仓库 release 查找并下载资产 ───────────────────────────────
+gh_api() {
+    local -a auth=()
+    [[ -n "$GH_TOKEN" ]] && auth=(-H "Authorization: Bearer ${GH_TOKEN}")
+    curl -fsSL "${auth[@]}" -H "Accept: application/vnd.github+json" "$@"
+}
+# 列出某 tag 下全部资产: 每行 "资产名<TAB>资产API地址", 按更新时间新→旧
+list_assets() {
+    local tag="$1" rid page=1 out
+    [[ -n "$REPO" ]] || { echo "未指定 REPO, 无法查找 release" >&2; return 1; }
+    rid="$(gh_api "https://api.github.com/repos/${REPO}/releases/tags/${tag}" | jq -r '.id')" \
+        || { echo "找不到 release tag: ${tag}" >&2; return 1; }
+    while :; do
+        out="$(gh_api "https://api.github.com/repos/${REPO}/releases/${rid}/assets?per_page=100&page=${page}")"
+        [[ "$(jq 'length' <<<"$out")" -eq 0 ]] && break
+        jq -r '.[] | [.updated_at, .name, .url] | @tsv' <<<"$out"
+        page=$((page+1))
+    done | sort -r | cut -f2-
+}
+download_asset() {   # $1=asset API url  $2=输出文件
+    local -a auth=()
+    [[ -n "$GH_TOKEN" ]] && auth=(-H "Authorization: Bearer ${GH_TOKEN}")
+    curl -fSL --retry 3 "${auth[@]}" -H "Accept: application/octet-stream" -o "$2" "$1"
+}
+distro_prefix() {
+    case "${1,,}" in
+        debian) echo Debian;;   ubuntu) echo Ubuntu;;   alpine) echo Alpine;;
+        fedora) echo Fedora;;   archlinux|arch) echo Archlinux;;
+        opensuse|suse) echo openSUSE;;  void) echo Void;;
+        openwrt) echo OpenWrt;; nixos|nix) echo NixOS;;
+        *) echo "未知发行版: $1" >&2; return 1;;
+    esac
+}
+
 WORK="$(mktemp -d /tmp/p2build.XXXXXX)"
 mkdir -p "$OUT"
 LOOP="" ; CLEANUP() {
@@ -30,12 +72,28 @@ trap CLEANUP EXIT
 step "1/7 安装依赖"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq dosfstools e2fsprogs parted wget gzip kmod xz-utils cpio u-boot-tools > /dev/null
+apt-get install -y -qq dosfstools e2fsprogs parted wget curl jq gzip kmod xz-utils cpio u-boot-tools > /dev/null
 
 step "2/7 下载并解包内核 deb"
 cd "$WORK"
-echo "下载内核 deb: ${KERNEL_DEB_URL}"
-wget -q -O kernel.deb "$KERNEL_DEB_URL"
+if [[ -n "$KERNEL_DEB_URL" ]]; then
+    echo "下载内核 deb (链接): ${KERNEL_DEB_URL}"
+    wget -q -O kernel.deb "$KERNEL_DEB_URL"
+else
+    echo "未提供内核链接, 在 ${REPO} 的 release(${KERNEL_TAG}) 中查找: 内核版本=${KERNEL_VERSION:-最新}"
+    ALL="$(list_assets "$KERNEL_TAG" | grep -E '^panther-x2-kernel-.*\.deb\s' || true)"
+    if [[ -n "$KERNEL_VERSION" ]]; then
+        PFX="panther-x2-kernel-${KERNEL_VERSION}"
+        # 版本号后必须紧跟 "-"(后缀) 或 ".deb", 避免 7.3.1 误匹配 7.3.10
+        MATCH="$(awk -F'\t' -v p="$PFX" 'index($1,p)==1 { r=substr($1,length(p)+1); if (r ~ /^-/ || r == ".deb") print $0 }' <<<"$ALL" | head -1)"
+    else
+        MATCH="$(sort -t$'\t' -k1,1 -V <<<"$ALL" | tail -1)"
+    fi
+    [[ -n "${MATCH:-}" ]] || { echo "release(${KERNEL_TAG}) 中没有内核版本 '${KERNEL_VERSION:-最新}'; 现有:"; cut -f1 <<<"$ALL"; exit 1; }
+    echo "命中内核: $(cut -f1 <<<"$MATCH")"
+    download_asset "$(cut -f2 <<<"$MATCH")" kernel.deb
+    KERNEL_DEB_URL="release:${KERNEL_TAG}/$(cut -f1 <<<"$MATCH")"
+fi
 echo "下载完成: $(du -h kernel.deb | awk '{print $1}')"
 rm -rf kernelpkg && mkdir kernelpkg
 dpkg-deb -x kernel.deb kernelpkg
@@ -46,8 +104,32 @@ VMLINUZ="kernelpkg/boot/Image"
 echo "KVER = ${KVER}"
 
 step "3/7 下载并提取 rootfs 底座"
+if [[ -z "$ROOTFS_URL" ]]; then
+    [[ -n "$DISTRO" ]] || { echo "未提供 rootfs 链接, 必须指定发行版 DISTRO"; exit 1; }
+    # DISTRO 支持 "发行版/版本" 合写, 如 debian/bookworm ; 版本为 latest 或留空 = 该发行版最新
+    if [[ "$DISTRO" == */* ]]; then DISTRO_VERSION="${DISTRO#*/}"; DISTRO="${DISTRO%%/*}"; fi
+    [[ "$DISTRO_VERSION" == "latest" ]] && DISTRO_VERSION=""
+    PFX="$(distro_prefix "$DISTRO")"
+    echo "未提供 rootfs 链接, 在 ${REPO} 的 release(${ROOTFS_TAG}) 中查找: ${PFX} 版本=${DISTRO_VERSION:-最新}"
+    ALL="$(list_assets "$ROOTFS_TAG" | grep -E "^${PFX}_.*_arm64_rootfs\.img\.(gz|xz)\s|^${PFX}-.*rootfs.*\.img\.(gz|xz)\s" || true)"
+    [[ "$PFX" == Alpine && -z "$DISTRO_VERSION" ]] && ALL="$(grep -v '^Alpine_edge_' <<<"$ALL" || true)"   # alpine/latest = 最新稳定版, 不含 edge
+    case "$PFX" in Void|NixOS) DISTRO_VERSION="";; esac   # 这两个发行版文件名不带版本
+    if [[ -n "$DISTRO_VERSION" ]]; then
+        # 文件名形如 Debian_bookworm_arm64_rootfs.img.gz, 版本为第二段, 精确匹配
+        MATCH="$(awk -F'\t' -v p="${PFX}_${DISTRO_VERSION}_" 'index($1,p)==1' <<<"$ALL" | head -1)"
+    else
+        MATCH="$(head -1 <<<"$ALL")"   # list_assets 已按更新时间新→旧排序
+    fi
+    [[ -n "${MATCH:-}" ]] || { echo "release(${ROOTFS_TAG}) 中没有 ${PFX} 版本 '${DISTRO_VERSION:-最新}'; 现有:"; cut -f1 <<<"$ALL"; exit 1; }
+    RFNAME="$(cut -f1 <<<"$MATCH")"
+    echo "命中 rootfs: ${RFNAME}"
+    case "$RFNAME" in
+        *.xz) download_asset "$(cut -f2 <<<"$MATCH")" rootfs.img.xz; xz -d -f -T0 rootfs.img.xz;;
+        *)    download_asset "$(cut -f2 <<<"$MATCH")" rootfs.img.gz; gunzip -f rootfs.img.gz;;
+    esac
+    ROOTFS_URL="release:${ROOTFS_TAG}/${RFNAME}"
 # 依据 URL 后缀自动识别压缩格式 (.img.xz 或 .img.gz)，两者都支持
-if [[ "$ROOTFS_URL" == *.xz ]]; then
+elif [[ "$ROOTFS_URL" == *.xz ]]; then
     echo "下载 rootfs (.xz): ${ROOTFS_URL}"
     wget -q -O rootfs.img.xz "$ROOTFS_URL"
     echo "下载完成: $(du -h rootfs.img.xz | awk '{print $1}')"
