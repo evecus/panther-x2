@@ -7,7 +7,7 @@ on:
       rootfs:
         description: "发行版/版本 (未填 rootfs 直链时, 从本仓库 release 查找; latest=该发行版最新)"
         required: true
-        default: "debian/trixie"
+        default: "debian/bookworm"
         type: choice
         options:
           - debian/bookworm
@@ -78,7 +78,19 @@ jobs:
           REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          sudo -E OUT="${GITHUB_WORKSPACE}/out" bash rebuild
+          # runner 上 sudo -E 会被忽略, 必须显式传递变量
+          sudo \
+            KERNEL_DEB_URL="${KERNEL_DEB_URL}" \
+            ROOTFS_URL="${ROOTFS_URL}" \
+            DISTRO="${DISTRO}" \
+            KERNEL_VERSION="${KERNEL_VERSION}" \
+            ROOT_MB="${ROOT_MB}" \
+            ROOT_PASS="${ROOT_PASS}" \
+            SSH_PUBKEY="${SSH_PUBKEY}" \
+            REPO="${REPO}" \
+            GH_TOKEN="${GH_TOKEN}" \
+            OUT="${GITHUB_WORKSPACE}/out" \
+            bash rebuild
 
       - name: Prepare release files
         run: |
