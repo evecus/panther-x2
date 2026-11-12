@@ -385,7 +385,7 @@ jobs:
         with:
           tag: "rootfs"
           name: "rootfs"
-          prerelease: true
+          prerelease: false
           artifacts: |
             ${{ steps.wrap_image.outputs.IMG_GZ_PATH }}
           allowUpdates: true
